@@ -5,7 +5,7 @@ SET QUOTED_IDENTIFIER ON
 GO
 
 /*
-    DBATools.usp_GetDBStatus 2.1.0 (2026-11-19)
+    DBATools.usp_GetDBStatus 2.1.1 (2026-11-19)
 
     Purpose        Shows what is happening on one Azure SQL Database now: health summary and
                    findings, blocking, requests, waits, resources, memory, tempdb, transactions,
@@ -23,7 +23,7 @@ GO
 
     Test after deploy
     Run these four commands in the database. The MESSAGES result (the last one) must hold no
-    ERROR row that version 2.0.0 does not also give.
+    ERROR row.
 
         -- 1. Default run. @debug = 1 adds the time of each result to MESSAGES.
         EXEC DBATools.usp_GetDBStatus @debug = 1;
@@ -38,6 +38,20 @@ GO
 
         -- 4. log_usage: log_max_mb must be a plausible log limit for the service objective.
         EXEC DBATools.usp_GetDBStatus @section = 'transactions';
+
+    Changes in 2.1.1 (from the first run of 2.1.0 on Azure SQL Database)
+    - Idle transactions: a session that is idle with an open transaction is a HIGH or MEDIUM
+      finding only when the transaction wrote log, reads under SNAPSHOT, keeps shared locks
+      (REPEATABLE READ, SERIALIZABLE) or blocks others. A driver with autocommit off leaves
+      transactions open that have done no work; they are now one LOW finding, and they no longer
+      count as the oldest transaction. open_transactions has the new column holds_resources.
+    - tempdb by session: pages of dropped temp tables whose deallocation is deferred are no
+      longer counted as in use.
+    - Wait catalog: HTBUILD_*, HTDELETE_*, BMP* (batch mode) and SOS_PHYS_PAGE_CACHE (memory)
+      have a category and an explanation. They were "Other".
+    - waits_now: a parallel query that waits on its own threads no longer shows itself as blocker.
+    - replicas: the text no longer says that only the local replica is visible when a secondary
+      is listed, and it says that the role of a geo-replication link is the role of this database.
 
     Changes in 2.1.0
     - Blocking tree: built breadth-first, so each session appears once. 2.0.0 followed every
@@ -77,7 +91,7 @@ BEGIN
     SET DEADLOCK_PRIORITY LOW;
 
     SELECT
-        @version = '2.1.0',
+        @version = '2.1.1',
         @version_date = '20261119';
 
     /* ============================================================================================
@@ -85,7 +99,7 @@ BEGIN
        ============================================================================================ */
     IF @help = 1
     BEGIN
-        PRINT N'DBATools.usp_GetDBStatus v2.1.0 - what is happening on this Azure SQL Database right now.';
+        PRINT N'DBATools.usp_GetDBStatus v2.1.1 - what is happening on this Azure SQL Database right now.';
         PRINT N'Run it in the database you want to inspect. Everything it does is read-only.';
 
         SELECT
@@ -508,7 +522,8 @@ BEGIN
         log_bytes_reserved bigint NULL,
         is_snapshot bit NULL,
         snapshot_elapsed_s bigint NULL,
-        max_version_chain int NULL
+        max_version_chain int NULL,
+        holds_resources bit NULL
     );
 
     CREATE TABLE #grants
@@ -719,6 +734,13 @@ BEGIN
         (N'HTREINIT', 10, N'Batch mode', N'Batch mode hash table reinitialization.'),
         (N'HTREPARTITION', 10, N'Batch mode', N'Batch mode hash table repartitioning.'),
         (N'BPSORT', 10, N'Batch mode', N'Batch mode sort synchronization.'),
+        (N'HTBUILD%', 40, N'Batch mode', N'Batch mode hash table build synchronization between parallel threads (hash join or hash aggregate).'),
+        (N'HTDELETE%', 40, N'Batch mode', N'Batch mode hash table cleanup synchronization between parallel threads (hash join or hash aggregate).'),
+        (N'HTMEMO%', 40, N'Batch mode', N'Batch mode hash table synchronization between parallel threads.'),
+        (N'HTREINIT%', 40, N'Batch mode', N'Batch mode hash table reinitialization between parallel threads.'),
+        (N'HTREPARTITION%', 40, N'Batch mode', N'Batch mode hash table repartitioning between parallel threads.'),
+        (N'BMP%', 40, N'Batch mode', N'Batch mode bitmap filter synchronization between parallel threads.'),
+        (N'SOS_PHYS_PAGE_CACHE', 10, N'Memory', N'Waiting for the lock on physical page allocation: memory is being allocated or released, for example when the buffer pool grows or shrinks.'),
         (N'PWAIT_QRY_BPMEMORY', 10, N'Batch mode', N'Batch mode memory synchronization.'),
         (N'RESOURCE_SEMAPHORE', 10, N'Memory grants', N'Queries waiting for a workspace memory grant: large sorts or hashes, bad estimates or too many concurrent grants.'),
         (N'RESOURCE_SEMAPHORE_QUERY_COMPILE', 10, N'Compilation', N'Queries waiting for compile memory: many concurrent large compilations.'),
@@ -1240,6 +1262,22 @@ BEGIN
         VALUES ('ERROR', N'snapshot', LEFT(N'Transaction DMVs: ' + ERROR_MESSAGE(), 4000));
     END CATCH;
 
+    /* A transaction holds resources when it wrote log, reads under SNAPSHOT, or runs at an
+       isolation level that keeps its shared locks until it ends. A driver with autocommit off
+       (pyodbc, JDBC) leaves transactions open that have done none of these: they hold no locks,
+       no log and no row versions, so they are not a problem while they stay like that. */
+    UPDATE t
+    SET t.holds_resources =
+        CASE
+            WHEN t.log_record_count > 0 OR t.log_bytes_used > 0 THEN 1
+            WHEN t.is_snapshot = 1 THEN 1
+            WHEN t.db_tran_state IS NOT NULL AND s.transaction_isolation_level IN (3, 4) THEN 1
+            ELSE 0
+        END
+    FROM #trn AS t
+    LEFT JOIN #sess AS s
+      ON s.session_id = t.session_id;
+
     BEGIN TRY
         INSERT #grants
         (
@@ -1318,6 +1356,35 @@ BEGIN
         BEGIN CATCH
             INSERT #messages (msg_type, section, message)
             VALUES ('INFO', N'snapshot', LEFT(N'tempdb space usage DMVs: ' + ERROR_MESSAGE(), 4000));
+        END CATCH;
+
+        /* A dropped temp table whose deallocation is deferred no longer uses space, but the session
+           counters above still count its pages (seen: one sleeping session shown with 1.4 GB while
+           all of tempdb held 33 MB of user objects). Dynamic SQL on purpose: if the column is not
+           there, this correction becomes a message and the procedure continues. */
+        SET @sql = N'
+UPDATE t
+SET t.session_user_pages = CASE WHEN t.session_user_pages > d.deferred_pages THEN t.session_user_pages - d.deferred_pages ELSE 0 END
+FROM #tsu AS t
+JOIN
+(
+    SELECT
+        ssu.session_id,
+        deferred_pages = SUM(CONVERT(bigint, ssu.user_objects_deferred_dealloc_page_count))
+    FROM sys.dm_db_session_space_usage AS ssu
+    GROUP BY
+        ssu.session_id
+) AS d
+  ON d.session_id = t.session_id
+WHERE d.deferred_pages > 0;';
+
+        BEGIN TRY
+            IF @debug = 1 PRINT @sql;
+            EXEC sys.sp_executesql @sql;
+        END TRY
+        BEGIN CATCH
+            INSERT #messages (msg_type, section, message)
+            VALUES ('INFO', N'snapshot', LEFT(N'tempdb deferred deallocation: ' + ERROR_MESSAGE(), 4000));
         END CATCH;
     END;
 
@@ -2459,7 +2526,7 @@ BEGIN
                 avg_wait_ms = a.avg_wait_ms,
                 max_wait_ms = a.max_wait_ms,
                 longest_waiter_session_id = l.session_id,
-                longest_waiter_blocked_by = NULLIF(l.blocking_session_id, 0),
+                longest_waiter_blocked_by = CASE WHEN l.blocking_session_id NOT IN (0, l.session_id) THEN l.blocking_session_id END,
                 longest_waiter_resource = LEFT(l.resource_description, 256),
                 longest_waiter_resource_decoded = wr.decoded,
                 explanation = c.explanation
@@ -3863,14 +3930,18 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                             (
                                 CASE WHEN q.transaction_state = 7 THEN N', ROLLING BACK' END,
                                 CASE WHEN q.total_blocked > 0 THEN CONCAT(N', BLOCKING ', q.total_blocked, N' SESSION(S)') END,
-                                CASE WHEN q.request_session_id IS NULL AND q.session_status = N'sleeping' AND q.idle_ms >= 5000 THEN N', SLEEPING WITH OPEN TRANSACTION' END,
-                                CASE WHEN q.tran_ms >= 600000 THEN N', OPEN > 10 MIN' END,
+                                CASE
+                                    WHEN q.request_session_id IS NULL AND q.session_status = N'sleeping' AND q.idle_ms >= 5000
+                                    THEN CASE WHEN q.holds_resources = 1 OR q.total_blocked > 0 THEN N', SLEEPING WITH OPEN TRANSACTION' ELSE N', SLEEPING, TRANSACTION HAS DONE NO WORK' END
+                                END,
+                                CASE WHEN q.tran_ms >= 600000 AND (q.holds_resources = 1 OR q.total_blocked > 0 OR q.request_session_id IS NOT NULL) THEN N', OPEN > 10 MIN' END,
                                 CASE WHEN q.log_bytes_used >= 1073741824 THEN N', > 1 GB LOG' END
                             ),
                             1, 2, N''
                         ),
                         N''
                     ),
+                holds_resources = CONVERT(bit, CASE WHEN q.holds_resources = 1 OR q.total_blocked > 0 THEN 1 ELSE 0 END),
                 transaction_age =
                     CASE
                         WHEN q.tran_ms >= 0
@@ -4219,7 +4290,7 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                 N'HA replica',
                 CONCAT(CASE WHEN rs.is_local = 1 THEN N'local ' ELSE N'remote ' END, CONVERT(nvarchar(36), rs.replica_id)),
                 CASE WHEN rs.is_primary_replica = 1 THEN N'PRIMARY' ELSE N'SECONDARY' END,
-                CONCAT(rs.synchronization_state_desc, N' / ', rs.database_state_desc) COLLATE DATABASE_DEFAULT,
+                CONCAT(rs.synchronization_state_desc, N' / ' + rs.database_state_desc) COLLATE DATABASE_DEFAULT,
                 rs.synchronization_health_desc COLLATE DATABASE_DEFAULT,
                 rs.is_suspended,
                 rs.suspend_reason_desc COLLATE DATABASE_DEFAULT,
@@ -4307,7 +4378,10 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                         WHEN r.lag_seconds >= 60
                         THEN N'Replica is more than a minute behind: heavy log generation, or the secondary is undersized or busy.'
                         WHEN r.sort_group = 1 AND r.role = N'PRIMARY'
-                        THEN N'OK. Only the local replica is visible from the primary in Azure SQL Database.'
+                        AND  NOT EXISTS (SELECT 1/0 FROM #replicas AS r2 WHERE r2.sort_group = 1 AND r2.role <> N'PRIMARY')
+                        THEN N'OK. No secondary replica is visible from this connection.'
+                        WHEN r.sort_group = 2
+                        THEN N'OK. The role column is the role of this database in the link.'
                         ELSE N'OK'
                     END
             INTO #o_replicas
@@ -4844,7 +4918,7 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                 notes =
                     ISNULL(STUFF(CONCAT(
                         CASE WHEN g.blocking_others > 0 THEN N'; blocking other sessions' END,
-                        CASE WHEN g.idle_with_open_tran > 0 THEN CONCAT(N'; ', g.idle_with_open_tran, N' idle session(s) holding an open transaction') END,
+                        CASE WHEN g.idle_with_open_tran > 0 THEN CONCAT(N'; ', g.idle_with_open_tran, N' idle session(s) with an open transaction') END,
                         CASE WHEN @rg_max_sessions > 0 AND g.sessions * 2 >= @rg_max_sessions THEN N'; uses half or more of the session limit' END,
                         CASE WHEN g.sessions >= 20 AND g.idle_over_30_min * 2 >= g.sessions THEN N'; mostly long-idle connections (pool larger than needed?)' END
                     ), 1, 2, N''), N'')
@@ -6716,6 +6790,8 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         @f_tran_oldest_log_mb decimal(19, 1),
         @f_idle_tran int,
         @f_idle_tran_max_s bigint,
+        @f_idle_work int,
+        @f_idle_work_max_s bigint,
         @f_idle_tran_session int,
         @f_idle_tran_session_s bigint,
         @f_idle_tran_who nvarchar(600),
@@ -7163,13 +7239,27 @@ AND   mh.severity_level >= 3;';
             WHERE s.database_id = @db_id
             AND   s.is_user_process = 1
             AND   ISNULL(t.transaction_begin_time, t.db_tran_begin_time) IS NOT NULL
+            /* A sleeping transaction that has done no work is not "the oldest transaction" */
+            AND   (t.holds_resources = 1 OR r.session_id IS NOT NULL)
             ORDER BY
                 ISNULL(t.transaction_begin_time, t.db_tran_begin_time);
 
             SELECT
                 @f_idle_tran = COUNT(*),
-                @f_idle_tran_max_s = MAX(DATEDIFF_BIG(SECOND, ISNULL(s.last_request_end_time, s.login_time), @now))
+                @f_idle_tran_max_s = MAX(DATEDIFF_BIG(SECOND, ISNULL(s.last_request_end_time, s.login_time), @now)),
+                @f_idle_work = ISNULL(SUM(h.holds), 0),
+                @f_idle_work_max_s = MAX(CASE WHEN h.holds = 1 THEN DATEDIFF_BIG(SECOND, ISNULL(s.last_request_end_time, s.login_time), @now) END)
             FROM #sess AS s
+            CROSS APPLY
+            (
+                SELECT
+                    holds =
+                        CASE
+                            WHEN EXISTS (SELECT 1/0 FROM #trn AS th WHERE th.session_id = s.session_id AND th.holds_resources = 1) THEN 1
+                            WHEN EXISTS (SELECT 1/0 FROM #blk_counts AS ch WHERE ch.session_id = s.session_id AND ch.total_blocked > 0) THEN 1
+                            ELSE 0
+                        END
+            ) AS h
             WHERE s.database_id = @db_id
             AND   s.is_user_process = 1
             AND   s.open_transaction_count > 0
@@ -7197,6 +7287,16 @@ AND   mh.severity_level >= 3;';
                 FROM #trn AS t
                 WHERE t.session_id = s.session_id
             ) AS ta
+            CROSS APPLY
+            (
+                SELECT
+                    holds =
+                        CASE
+                            WHEN EXISTS (SELECT 1/0 FROM #trn AS th WHERE th.session_id = s.session_id AND th.holds_resources = 1) THEN 1
+                            WHEN EXISTS (SELECT 1/0 FROM #blk_counts AS ch WHERE ch.session_id = s.session_id AND ch.total_blocked > 0) THEN 1
+                            ELSE 0
+                        END
+            ) AS h
             WHERE s.database_id = @db_id
             AND   s.is_user_process = 1
             AND   s.open_transaction_count > 0
@@ -7208,6 +7308,7 @@ AND   mh.severity_level >= 3;';
                 WHERE r.session_id = s.session_id
             )
             ORDER BY
+                h.holds DESC,
                 ISNULL(c.total_blocked, 0) DESC,
                 ISNULL(s.last_request_end_time, s.login_time),
                 s.session_id;
@@ -7433,7 +7534,7 @@ AND   mh.severity_level >= 3;';
             FROM #replicas AS r;
 
             SELECT TOP (1)
-                @f_geo_partner = LEFT(CONCAT(r.replica, N' (', r.role, N', ', r.state, N')'), 600)
+                @f_geo_partner = LEFT(CONCAT(r.replica, N' (this database is the ', r.role, N', link state ', r.state, N')'), 600)
             FROM #replicas AS r
             WHERE r.sort_group = 2
             ORDER BY
@@ -7759,17 +7860,31 @@ AND   mh.severity_level >= 3;';
                     N'open_transactions, version_store, log_usage'
                 ),
                 (
-                    CASE WHEN @f_idle_tran_max_s >= 600 THEN 2 WHEN @f_idle_tran_max_s >= 60 THEN 3 END,
+                    CASE
+                        WHEN @f_idle_work_max_s >= 600 THEN 2
+                        WHEN @f_idle_work_max_s >= 60 THEN 3
+                        WHEN @f_idle_work = 0 AND @f_idle_tran_max_s >= 600 THEN 4
+                    END,
                     N'Transactions',
-                    CONCAT(@f_idle_tran, N' session(s) idle with an open transaction, up to ', @f_idle_tran_max_s, N' s'),
+                    CASE
+                        WHEN @f_idle_work > 0
+                        THEN CONCAT(@f_idle_work, N' session(s) idle with an open transaction that holds locks, log or row versions, up to ', @f_idle_work_max_s, N' s')
+                        ELSE CONCAT(@f_idle_tran, N' session(s) idle with an open transaction that has done no work, up to ', @f_idle_tran_max_s, N' s')
+                    END,
                     CONCAT
                     (
+                        @f_idle_tran, N' idle session(s) have an open transaction; ', ISNULL(@f_idle_work, 0),
+                        N' of them wrote log, read under SNAPSHOT, keep shared locks or block others; ',
                         N'session ', @f_idle_tran_session, N' idle ', @f_idle_tran_session_s, N' s',
                         CASE WHEN @f_idle_tran_age_s IS NOT NULL THEN CONCAT(N', transaction open ', @f_idle_tran_age_s, N' s') END,
                         CASE WHEN @f_idle_tran_blocking > 0 THEN CONCAT(N', blocking ', @f_idle_tran_blocking, N' session(s)') END,
                         N': ', @f_idle_tran_who
                     ),
-                    N'The application opened a transaction and stopped sending work without committing. Check the input buffer in open_transactions and fix the code path (missing COMMIT, error handling without ROLLBACK, implicit transactions left on).',
+                    CASE
+                        WHEN @f_idle_work > 0
+                        THEN N'The application opened a transaction and stopped sending work without committing. Check the input buffer in open_transactions and fix the code path (missing COMMIT, error handling without ROLLBACK, implicit transactions left on).'
+                        ELSE N'These transactions wrote nothing and hold no locks, log or row versions, so they block nobody now. The usual cause is a driver with autocommit off (pyodbc, JDBC), which opens a transaction with the first statement. Turn autocommit on, or commit after each unit of work: such a session becomes a blocker as soon as it writes and then idles.'
+                    END,
                     N'open_transactions, sessions_by_app, blocking_tree'
                 ),
                 (
@@ -8325,12 +8440,12 @@ AND   mh.severity_level >= 3;';
                             WHEN @f_tran_oldest_session IS NOT NULL
                             THEN CONCAT
                                  (
-                                     N'oldest: session ', @f_tran_oldest_session, N', open ', @f_tran_oldest_s, N' s, ', @f_tran_oldest_state,
+                                     N'oldest that runs or holds resources: session ', @f_tran_oldest_session, N', open ', @f_tran_oldest_s, N' s, ', @f_tran_oldest_state,
                                      N', ', ISNULL(CONVERT(nvarchar(30), @f_tran_oldest_log_mb), N'0'), N' MB of log'
                                  )
-                            ELSE N'no open user transactions in this database'
+                            ELSE N'no open user transaction runs or holds locks, log or row versions'
                         END,
-                        CASE WHEN @f_idle_tran > 0 THEN CONCAT(N'; ', @f_idle_tran, N' session(s) idle with an open transaction (longest idle ', @f_idle_tran_max_s, N' s)') END
+                        CASE WHEN @f_idle_tran > 0 THEN CONCAT(N'; ', @f_idle_tran, N' session(s) idle with an open transaction (longest idle ', @f_idle_tran_max_s, N' s), ', ISNULL(@f_idle_work, 0), N' of them hold resources') END
                     )
                 ),
                 (

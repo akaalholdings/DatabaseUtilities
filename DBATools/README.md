@@ -4,7 +4,11 @@
 
 The procedure only reads. It writes to its own temp tables and to no other object.
 
-Status of version 2.1.0: the script parses without errors. It has not yet run on Azure SQL Database. Run the test below before you rely on it.
+Status:
+
+- Version 2.1.0 ran on one Azure SQL Database (Hyperscale) on 2026-11-19. The four test commands below completed and MESSAGES held no `ERROR` row.
+- That database had no blocking and no worker starvation at the time. The blocking tree and the THREADPOOL path have therefore not yet run with data.
+- Version 2.1.1 fixes what that run showed (see the header of the script). It parses without errors and has not yet run on Azure SQL Database. Run the test below before you rely on it.
 
 ## Deploy
 
@@ -40,7 +44,7 @@ The caller needs `VIEW DATABASE STATE`. When the caller cannot read the source o
 
 ## Test after deploy
 
-Run these four commands in the database. The MESSAGES result (the last one) must hold no `ERROR` row that version 2.0.0 does not also give. The same commands are in the header comment of the procedure.
+Run these four commands in the database. The MESSAGES result (the last one) must hold no `ERROR` row. The same commands are in the header comment of the procedure.
 
 ```sql
 EXEC DBATools.usp_GetDBStatus @debug = 1;
@@ -76,5 +80,6 @@ It needs macOS with the VS Code `mssql` extension and the VS Code .NET runtime. 
 - Azure SQL Database only. The procedure stops on any other engine edition.
 - Catalog views do not honour `READ UNCOMMITTED`. When a session holds a schema modification lock, each statement that reads the catalog can wait up to 5 seconds (`LOCK_TIMEOUT`) before it reports the error and continues.
 - The blocking tree shows each session under one blocker. `also_blocked_by` lists the others.
+- `holds_resources` in `open_transactions` looks at this database only. A transaction that wrote only to tempdb (temp tables) shows 0 there.
 - Deadlocks are read only from a running database Extended Events session with a `ring_buffer` target. The procedure prints the script to create one when none exists.
 - Index usage counters cover only the time since the last restart, failover or change of service objective, and only this replica.

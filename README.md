@@ -24,7 +24,7 @@ EXEC DBATools.usp_GetDBStatus @help = 1;
 
 ## Status
 
-Version 2.1.0 of `usp_GetDBStatus` parses without errors (Microsoft ScriptDom, TSql170). It has not yet run on Azure SQL Database. Run the test in [`DBATools/README.md`](DBATools/README.md) before you rely on it. Version 2.0.0 is the first commit of the file.
+Version 2.1.0 of `usp_GetDBStatus` ran on one Azure SQL Database (Hyperscale) on 2026-11-19 with no error. Version 2.1.1 fixes what that run showed; it parses without errors (Microsoft ScriptDom, TSql170) and has not yet run on Azure SQL Database. Run the test in [`DBATools/README.md`](DBATools/README.md) before you rely on it. Version 2.0.0 is the first commit of the file.
 
 ## How to test
 
