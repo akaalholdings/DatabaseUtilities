@@ -5,7 +5,7 @@ SET QUOTED_IDENTIFIER ON
 GO
 
 /*
-    DBATools.usp_GetDBStatus 2.1.1 (2026-11-19)
+    DBATools.usp_GetDBStatus 2.1.2 (2026-11-19)
 
     Purpose        Shows what is happening on one Azure SQL Database now: health summary and
                    findings, blocking, requests, waits, resources, memory, tempdb, transactions,
@@ -38,6 +38,14 @@ GO
 
         -- 4. log_usage: log_max_mb must be a plausible log limit for the service objective.
         EXEC DBATools.usp_GetDBStatus @section = 'transactions';
+
+    Changes in 2.1.2 (from the run of 2.1.1 on Azure SQL Database)
+    - New result session_waits_sampled (with @sample_seconds): the waits of the sessions in this
+      database during the sample, from sys.dm_exec_session_wait_stats. The database wait
+      statistics (wait_stats) showed 38 ms of waits in a 10-second sample while 33 tasks of
+      running parallel queries were waiting: a request's waits reached them only after the
+      request ended. The summary and the governance finding now use the larger of the two
+      sources for each wait type.
 
     Changes in 2.1.1 (from the first run of 2.1.0 on Azure SQL Database)
     - Idle transactions: a session that is idle with an open transaction is a HIGH or MEDIUM
@@ -91,7 +99,7 @@ BEGIN
     SET DEADLOCK_PRIORITY LOW;
 
     SELECT
-        @version = '2.1.1',
+        @version = '2.1.2',
         @version_date = '20261119';
 
     /* ============================================================================================
@@ -99,7 +107,7 @@ BEGIN
        ============================================================================================ */
     IF @help = 1
     BEGIN
-        PRINT N'DBATools.usp_GetDBStatus v2.1.1 - what is happening on this Azure SQL Database right now.';
+        PRINT N'DBATools.usp_GetDBStatus v2.1.2 - what is happening on this Azure SQL Database right now.';
         PRINT N'Run it in the database you want to inspect. Everything it does is read-only.';
 
         SELECT
@@ -137,7 +145,7 @@ BEGIN
                 (1, N'summary', N'fast', N'summary, findings', N'Health rollup (CRITICAL / WARNING / ATTENTION / OK) and prioritized findings with evidence and next steps. Alias: findings.'),
                 (2, N'blocking', N'fast', N'blocking_tree', N'Who blocks whom: head blockers first, sleeping blockers with open transactions, decoded wait resources, locks held by head blockers.'),
                 (3, N'requests', N'fast', N'requests', N'Active requests: elapsed, waits, CPU/reads (and deltas when sampled), memory grant, tempdb, transaction, statement and input buffer.'),
-                (4, N'waits', N'fast', N'waits_now, wait_stats, index_lock_waits', N'Current waits, database wait stats (cumulative or sampled delta) with categories and explanations, and lock/latch waits by index.'),
+                (4, N'waits', N'fast', N'waits_now, wait_stats, session_waits_sampled (sampled), index_lock_waits', N'Current waits, database wait stats (cumulative or sampled delta) with categories and explanations, session waits during the sample (requests that still run included), and lock/latch waits by index.'),
                 (5, N'resources', N'fast', N'resource_stats, resource_samples (slow), governance, schedulers, workload_group, perf_counters', N'Service-objective utilization (dm_db_resource_stats), resource governance limits, workers, schedulers and key performance counters.'),
                 (6, N'memory', N'fast', N'memory_overview, memory_grants, resource_semaphores, memory_clerks, memory_health', N'Memory grants (pending first), grant semaphores, top memory clerks and memory health history.'),
                 (7, N'tempdb', N'fast', N'tempdb_space, tempdb_sessions', N'tempdb space by consumer type and the sessions using the most tempdb.'),
@@ -570,6 +578,16 @@ BEGIN
         waiting_tasks_count bigint NULL,
         wait_time_ms bigint NULL,
         max_wait_time_ms bigint NULL,
+        signal_wait_time_ms bigint NULL
+    );
+
+    CREATE TABLE #sess_waits_snap
+    (
+        sample_no tinyint NOT NULL,
+        session_id int NOT NULL,
+        wait_type nvarchar(128) COLLATE DATABASE_DEFAULT NOT NULL,
+        waiting_tasks_count bigint NULL,
+        wait_time_ms bigint NULL,
         signal_wait_time_ms bigint NULL
     );
 
@@ -1015,6 +1033,40 @@ BEGIN
             INSERT #messages (msg_type, section, message)
             VALUES ('INFO', N'snapshot', LEFT(N'sys.dm_os_performance_counters: ' + ERROR_MESSAGE(), 4000));
         END CATCH;
+
+        /* Waits per session. The database wait statistics get the waits of a request only after
+           the request ends, so over a short sample they miss the long requests that matter. The
+           session counters do not have that delay. Dynamic SQL on purpose: a problem with this
+           DMV becomes a message and the procedure continues. */
+        IF @is_sampled = 1
+        BEGIN
+            BEGIN TRY
+                EXEC sys.sp_executesql
+                    N'
+INSERT #sess_waits_snap (sample_no, session_id, wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms)
+SELECT
+    @sample_no,
+    sw.session_id,
+    sw.wait_type,
+    sw.waiting_tasks_count,
+    sw.wait_time_ms,
+    sw.signal_wait_time_ms
+FROM sys.dm_exec_session_wait_stats AS sw
+JOIN sys.dm_exec_sessions AS s
+  ON s.session_id = sw.session_id
+WHERE s.database_id = @db_id
+AND   s.is_user_process = 1
+AND   sw.session_id <> @@SPID
+AND   sw.wait_time_ms > 0;',
+                    N'@sample_no tinyint, @db_id int',
+                    @sample_no,
+                    @db_id;
+            END TRY
+            BEGIN CATCH
+                INSERT #messages (msg_type, section, message)
+                VALUES ('INFO', N'snapshot', LEFT(N'sys.dm_exec_session_wait_stats: ' + ERROR_MESSAGE(), 4000));
+            END CATCH;
+        END;
 
         IF @sample_no = 1
         BEGIN
@@ -2564,7 +2616,7 @@ WHERE d.deferred_pages > 0;';
             410, N'waits', @rk,
             CASE
                 WHEN @is_sampled = 1
-                THEN N'DATABASE WAIT STATS - DELTA OVER ' + CONVERT(nvarchar(20), @sample_s) + N' s (benign waits excluded)'
+                THEN N'DATABASE WAIT STATS - DELTA OVER ' + CONVERT(nvarchar(20), @sample_s) + N' s (benign waits excluded; the waits of a request can arrive here only after it ends: see session_waits_sampled)'
                 ELSE N'DATABASE WAIT STATS - CUMULATIVE (benign waits excluded; use @sample_seconds for a live delta)'
             END,
             N'#o_wait_stats',
@@ -2655,6 +2707,109 @@ WHERE d.deferred_pages > 0;';
         END CATCH;
 
         UPDATE #emit SET duration_ms = DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()) WHERE result_key = @rk;
+
+        IF @is_sampled = 1
+        BEGIN
+            SELECT
+                @rk = N'session_waits_sampled',
+                @t0 = SYSDATETIME();
+
+            INSERT #emit (section_order, section_key, result_key, result_name, table_name, empty_message)
+            VALUES
+            (
+                415, N'waits', @rk,
+                N'SESSION WAITS - DELTA OVER ' + CONVERT(nvarchar(20), @sample_s) + N' s (user sessions in this database, requests that still run included; benign waits excluded)',
+                N'#o_session_waits_sampled',
+                N'No user session in this database recorded a wait during the sample.'
+            );
+
+            BEGIN TRY
+                WITH
+                    d AS
+                    (
+                        SELECT
+                            w2.session_id,
+                            w2.wait_type,
+                            wait_ms = w2.wait_time_ms - ISNULL(w1.wait_time_ms, 0),
+                            waiting_tasks = w2.waiting_tasks_count - ISNULL(w1.waiting_tasks_count, 0),
+                            signal_ms = w2.signal_wait_time_ms - ISNULL(w1.signal_wait_time_ms, 0)
+                        FROM #sess_waits_snap AS w2
+                        LEFT JOIN #sess_waits_snap AS w1
+                          ON  w1.sample_no = 1
+                          AND w1.session_id = w2.session_id
+                          AND w1.wait_type = w2.wait_type
+                        WHERE w2.sample_no = 2
+                        /* A session that was reset between the samples has lower counters: skip it */
+                        AND   w2.wait_time_ms - ISNULL(w1.wait_time_ms, 0) > 0
+                        AND   NOT EXISTS
+                        (
+                            SELECT
+                                1/0
+                            FROM #benign_waits AS b
+                            WHERE b.wait_type = w2.wait_type
+                        )
+                    ),
+                    r AS
+                    (
+                        SELECT
+                            d.session_id,
+                            d.wait_type,
+                            d.wait_ms,
+                            d.waiting_tasks,
+                            d.signal_ms,
+                            srn = ROW_NUMBER() OVER (PARTITION BY d.wait_type ORDER BY d.wait_ms DESC, d.session_id)
+                        FROM d
+                    ),
+                    a AS
+                    (
+                        SELECT
+                            r.wait_type,
+                            wait_ms = SUM(r.wait_ms),
+                            waiting_tasks = SUM(r.waiting_tasks),
+                            signal_ms = SUM(r.signal_ms),
+                            sessions = COUNT_BIG(*),
+                            top_session_id = MAX(CASE WHEN r.srn = 1 THEN r.session_id END),
+                            top_session_wait_ms = MAX(CASE WHEN r.srn = 1 THEN r.wait_ms END)
+                        FROM r
+                        GROUP BY
+                            r.wait_type
+                    )
+                SELECT TOP (@top_n)
+                    rn = ROW_NUMBER() OVER (ORDER BY a.wait_ms DESC, a.wait_type),
+                    wait_type = a.wait_type,
+                    category = c.category,
+                    wait_ms = a.wait_ms,
+                    pct_of_wait_time = CONVERT(decimal(9, 2), 100.0 * a.wait_ms / NULLIF(SUM(a.wait_ms) OVER (), 0)),
+                    waiting_tasks = a.waiting_tasks,
+                    avg_wait_ms = CONVERT(decimal(18, 2), 1.0 * a.wait_ms / NULLIF(a.waiting_tasks, 0)),
+                    signal_wait_pct = CONVERT(decimal(18, 2), 100.0 * a.signal_ms / NULLIF(a.wait_ms, 0)),
+                    avg_concurrent_waiters = CONVERT(decimal(18, 2), 1.0 * a.wait_ms / NULLIF(CONVERT(bigint, @sample_s * 1000), 0)),
+                    sessions = a.sessions,
+                    top_session_id = a.top_session_id,
+                    top_session_wait_ms = a.top_session_wait_ms,
+                    explanation = c.explanation
+                INTO #o_session_waits_sampled
+                FROM a
+                OUTER APPLY
+                (
+                    SELECT TOP (1)
+                        wc.category,
+                        wc.explanation
+                    FROM #wait_cat AS wc
+                    WHERE a.wait_type LIKE wc.pattern
+                    ORDER BY
+                        wc.priority
+                ) AS c
+                ORDER BY
+                    a.wait_ms DESC,
+                    a.wait_type;
+            END TRY
+            BEGIN CATCH
+                UPDATE #emit SET error_message = LEFT(ERROR_MESSAGE(), 4000) WHERE result_key = @rk;
+            END CATCH;
+
+            UPDATE #emit SET duration_ms = DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()) WHERE result_key = @rk;
+        END;
 
         SELECT
             @rk = N'index_lock_waits',
@@ -7409,29 +7564,64 @@ AND   mh.severity_level >= 3;';
         IF @is_sampled = 1
         BEGIN
             BEGIN TRY
+                /* For each wait type the larger of two sources: the database wait statistics (they
+                   include tasks without a session, such as THREADPOOL) and the session wait
+                   statistics (they include requests that still run). */
                 INSERT @f_wd (wait_type, wait_ms, tasks, is_gov)
                 SELECT
-                    s2.wait_type,
-                    s2.wait_time_ms - ISNULL(s1.wait_time_ms, 0),
-                    s2.waiting_tasks_count - ISNULL(s1.waiting_tasks_count, 0),
+                    y.wait_type,
+                    y.wait_ms,
+                    y.tasks,
                     CASE
-                        WHEN EXISTS (SELECT 1/0 FROM @f_gov AS g WHERE s2.wait_type LIKE g.pattern)
+                        WHEN EXISTS (SELECT 1/0 FROM @f_gov AS g WHERE y.wait_type LIKE g.pattern)
                         THEN 1
                         ELSE 0
                     END
-                FROM #waits_snap AS s2
-                LEFT JOIN #waits_snap AS s1
-                  ON  s1.sample_no = 1
-                  AND s1.wait_type = s2.wait_type
-                WHERE s2.sample_no = 2
-                AND   s2.wait_time_ms - ISNULL(s1.wait_time_ms, 0) > 0
-                AND   NOT EXISTS
+                FROM
                 (
                     SELECT
-                        1/0
-                    FROM #benign_waits AS b
-                    WHERE b.wait_type = s2.wait_type
-                );
+                        x.wait_type,
+                        wait_ms = MAX(x.wait_ms),
+                        tasks = MAX(x.tasks)
+                    FROM
+                    (
+                        SELECT
+                            s2.wait_type,
+                            wait_ms = s2.wait_time_ms - ISNULL(s1.wait_time_ms, 0),
+                            tasks = s2.waiting_tasks_count - ISNULL(s1.waiting_tasks_count, 0)
+                        FROM #waits_snap AS s2
+                        LEFT JOIN #waits_snap AS s1
+                          ON  s1.sample_no = 1
+                          AND s1.wait_type = s2.wait_type
+                        WHERE s2.sample_no = 2
+
+                        UNION ALL
+
+                        SELECT
+                            w2.wait_type,
+                            SUM(w2.wait_time_ms - ISNULL(w1.wait_time_ms, 0)),
+                            SUM(w2.waiting_tasks_count - ISNULL(w1.waiting_tasks_count, 0))
+                        FROM #sess_waits_snap AS w2
+                        LEFT JOIN #sess_waits_snap AS w1
+                          ON  w1.sample_no = 1
+                          AND w1.session_id = w2.session_id
+                          AND w1.wait_type = w2.wait_type
+                        WHERE w2.sample_no = 2
+                        AND   w2.wait_time_ms - ISNULL(w1.wait_time_ms, 0) > 0
+                        GROUP BY
+                            w2.wait_type
+                    ) AS x
+                    WHERE x.wait_ms > 0
+                    AND   NOT EXISTS
+                    (
+                        SELECT
+                            1/0
+                        FROM #benign_waits AS b
+                        WHERE b.wait_type = x.wait_type
+                    )
+                    GROUP BY
+                        x.wait_type
+                ) AS y;
 
                 SELECT
                     @f_wait_total_ms = SUM(d.wait_ms),

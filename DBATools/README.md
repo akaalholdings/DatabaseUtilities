@@ -8,7 +8,8 @@ Status:
 
 - Version 2.1.0 ran on one Azure SQL Database (Hyperscale) on 2026-11-19. The four test commands below completed and MESSAGES held no `ERROR` row.
 - That database had no blocking and no worker starvation at the time. The blocking tree and the THREADPOOL path have therefore not yet run with data.
-- Version 2.1.1 fixes what that run showed (see the header of the script). It parses without errors and has not yet run on Azure SQL Database. Run the test below before you rely on it.
+- Version 2.1.1 fixed what that run showed (see the header of the script). It ran on the same database on the same day: the four test commands completed, MESSAGES held no `ERROR` row, and each fix was visible in the results.
+- Version 2.1.2 adds the result `session_waits_sampled`. It parses without errors and has not yet run on Azure SQL Database. Run the test below before you rely on it.
 
 ## Deploy
 
@@ -36,7 +37,7 @@ EXEC DBATools.usp_GetDBStatus @help = 1;
 | `@effort` | `fast` | `slow` adds Query Store, deadlocks, statistics and index usage |
 | `@output` | `normal` | `json`, `text` or `textchunks` for tools that read JSON |
 | `@section` | `all` | Comma-separated list of sections. `fragmentation` and `buffer` run only when you name them |
-| `@sample_seconds` | `0` | 1 to 300: wait that long and report deltas for waits, file IO, counters and requests |
+| `@sample_seconds` | `0` | 1 to 300: wait that long and report deltas for waits, file IO, counters and requests. For waits, read `session_waits_sampled`: the database wait statistics get the waits of a request only after it ends |
 | `@lookback_minutes` | `60` | Window for the plan cache, Query Store and deadlocks |
 | `@include_plans` | `0` | `1` adds query plans |
 
