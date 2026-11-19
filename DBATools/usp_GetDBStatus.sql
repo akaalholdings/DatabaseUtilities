@@ -1,12 +1,57 @@
-/****** Object:  StoredProcedure [DBATools].[usp_GetDBStatus]    Script Date: 19/11/2026 13:40:40 ******/
 SET ANSI_NULLS ON
 GO
 
 SET QUOTED_IDENTIFIER ON
 GO
 
+/*
+    DBATools.usp_GetDBStatus 2.1.0 (2026-11-19)
 
-ALTER   PROCEDURE [DBATools].[usp_GetDBStatus]
+    Purpose        Shows what is happening on one Azure SQL Database now: health summary and
+                   findings, blocking, requests, waits, resources, memory, tempdb, transactions,
+                   IO, top queries, sessions and configuration.
+    Target         Azure SQL Database (EngineEdition 5). Deploy it in each database to inspect and
+                   run it there.
+    Class          Idempotent (CREATE OR ALTER). The procedure only reads; it writes to its own
+                   temp tables.
+    Prerequisites  The schema DBATools exists. The caller can read the DMVs (VIEW DATABASE STATE).
+                   A result whose source the caller cannot read shows the error in MESSAGES; the
+                   other results still return.
+    Rollback       Deploy version 2.0.0. Script the current procedure out of the database before
+                   you deploy this one, so that you have it.
+    Help           EXEC DBATools.usp_GetDBStatus @help = 1;
+
+    Test after deploy
+    Run these four commands in the database. The MESSAGES result (the last one) must hold no
+    ERROR row that version 2.0.0 does not also give.
+
+        -- 1. Default run. @debug = 1 adds the time of each result to MESSAGES.
+        EXEC DBATools.usp_GetDBStatus @debug = 1;
+
+        -- 2. Every slow section, with deltas measured over 10 seconds.
+        EXEC DBATools.usp_GetDBStatus @effort = 'slow', @sample_seconds = 10;
+
+        -- 3. JSON output. Each result is one JSON document. To test the blocking tree, hold an
+        --    open UPDATE in one session and block two other sessions behind it: blocking_tree
+        --    must show one HEAD and each waiter once.
+        EXEC DBATools.usp_GetDBStatus @section = 'blocking,waits,transactions', @output = 'json';
+
+        -- 4. log_usage: log_max_mb must be a plausible log limit for the service objective.
+        EXEC DBATools.usp_GetDBStatus @section = 'transactions';
+
+    Changes in 2.1.0
+    - Blocking tree: built breadth-first, so each session appears once. 2.0.0 followed every
+      path, which grows exponentially when sessions have several blockers (latch convoys), and
+      it reported chains deeper than 50 levels as a blocking cycle. New column also_blocked_by.
+    - THREADPOOL: tasks that wait for a worker thread have no session yet. 2.0.0 dropped them, so
+      the worker starvation finding could not see them. They are now counted and shown in waits_now.
+    - Log space: findings compare used log with the maximum log size, not with the current size
+      of a log file that still can grow. log_usage has log_max_mb and log_used_pct_of_max.
+    - Sessions: sys.dm_exec_connections is read once, not once per session.
+    - Stale statistics: the 20 % threshold applies below compatibility level 130.
+    - The lookback window ends when the live snapshot is taken, not before the sampling wait.
+*/
+CREATE OR ALTER PROCEDURE [DBATools].[usp_GetDBStatus]
     @effort nvarchar(10) = N'fast',             /* fast | slow                                           */
     @output nvarchar(10) = N'normal',           /* normal | json | text | textchunks                     */
     @section nvarchar(400) = N'all',            /* comma-separated list, see @help = 1                   */
@@ -32,15 +77,15 @@ BEGIN
     SET DEADLOCK_PRIORITY LOW;
 
     SELECT
-        @version = '2.0.0',
-        @version_date = '20261001';
+        @version = '2.1.0',
+        @version_date = '20261119';
 
     /* ============================================================================================
        Help
        ============================================================================================ */
     IF @help = 1
     BEGIN
-        PRINT N'DBATools.usp_GetDBStatus v2.0.0 - what is happening on this Azure SQL Database right now.';
+        PRINT N'DBATools.usp_GetDBStatus v2.1.0 - what is happening on this Azure SQL Database right now.';
         PRINT N'Run it in the database you want to inspect. Everything it does is read-only.';
 
         SELECT
@@ -299,11 +344,15 @@ BEGIN
         @rg_max_sessions int,
         @rg_cpu_limit decimal(9, 2),
         @rg_max_log_rate_mbps decimal(18, 2),
+        @rg_log_size_mb decimal(19, 1),
+        @log_file_max_mb decimal(19, 1),
+        @log_max_mb decimal(19, 1),
+        @compat_level int,
+        @blk_lvl int = 0,
+        @blk_rows int = 0,
+        @blk_max_lvl int = 990, /* sort_path is varchar(8000): 7 characters for the head + 8 per level */
         @instance_max_workers int,
         @instance_start datetime;
-
-    SET @window_start = DATEADD(MINUTE, -@lookback_minutes, @now);
-    SET @window_start_dto = TODATETIMEOFFSET(DATEADD(MINUTE, -@lookback_minutes, SYSUTCDATETIME()), 0);
 
     /* ============================================================================================
        Working tables (all created up front so that every later reference resolves)
@@ -379,6 +428,14 @@ BEGIN
         lock_timeout int NULL,
         deadlock_priority int NULL,
         group_id int NULL,
+        most_recent_sql_handle varbinary(64) NULL
+    );
+
+    CREATE TABLE #conn
+    (
+        session_id int NOT NULL PRIMARY KEY,
+        client_net_address nvarchar(48) COLLATE DATABASE_DEFAULT NULL,
+        connect_time datetime NULL,
         most_recent_sql_handle varbinary(64) NULL
     );
 
@@ -726,7 +783,8 @@ BEGIN
 
         SELECT
             @rcsi = d.is_read_committed_snapshot_on,
-            @physical_db_name = d.physical_database_name
+            @physical_db_name = d.physical_database_name,
+            @compat_level = d.compatibility_level
         FROM sys.databases AS d
         WHERE d.database_id = @db_id;
     END TRY
@@ -743,7 +801,8 @@ BEGIN
             @rg_max_workers = g.primary_group_max_workers,
             @rg_max_sessions = g.max_sessions,
             @rg_cpu_limit = g.cpu_limit,
-            @rg_max_log_rate_mbps = CONVERT(decimal(18, 2), g.primary_max_log_rate / 1048576.0)
+            @rg_max_log_rate_mbps = CONVERT(decimal(18, 2), g.primary_max_log_rate / 1048576.0),
+            @rg_log_size_mb = g.log_size_in_mb
         FROM sys.dm_user_db_resource_governance AS g
         WHERE g.database_id = @db_id;
     END TRY
@@ -751,6 +810,29 @@ BEGIN
         INSERT #messages (msg_type, section, message)
         VALUES ('ERROR', N'setup', LEFT(N'sys.dm_user_db_resource_governance: ' + ERROR_MESSAGE(), 4000));
     END CATCH;
+
+    /* Maximum log size: the smaller of the governance limit and the log file growth limit that
+       are known. A log file grows on demand, so "percent of the current file" says little. */
+    BEGIN TRY
+        SELECT
+            @log_file_max_mb =
+                CASE
+                    WHEN MIN(df.max_size) = -1 THEN NULL
+                    ELSE SUM(CONVERT(bigint, CASE WHEN df.max_size = 0 THEN df.size ELSE df.max_size END)) / 128.0
+                END
+        FROM sys.database_files AS df
+        WHERE df.type = 1;
+    END TRY
+    BEGIN CATCH
+        INSERT #messages (msg_type, section, message)
+        VALUES ('INFO', N'setup', LEFT(N'sys.database_files (log): ' + ERROR_MESSAGE(), 4000));
+    END CATCH;
+
+    SET @log_max_mb =
+        CASE
+            WHEN @rg_log_size_mb > 0 AND (@log_file_max_mb IS NULL OR @rg_log_size_mb < @log_file_max_mb) THEN @rg_log_size_mb
+            WHEN @log_file_max_mb > 0 THEN @log_file_max_mb
+        END;
 
     BEGIN TRY
         SELECT
@@ -943,10 +1025,14 @@ BEGIN
             THEN CONVERT(decimal(18, 3), DATEDIFF(MILLISECOND, @sample_start, @sample_end) / 1000.0)
         END;
 
-    /* Live snapshots are taken after the sampling wait, so ages are measured from here */
+    /* Live snapshots are taken after the sampling wait, so ages and the lookback window are
+       measured from here */
     SELECT
         @now = GETDATE(),
         @now_utc = GETUTCDATE();
+
+    SET @window_start = DATEADD(MINUTE, -@lookback_minutes, @now);
+    SET @window_start_dto = TODATETIMEOFFSET(DATEADD(MINUTE, -@lookback_minutes, SYSUTCDATETIME()), 0);
 
     /* ============================================================================================
        Live snapshots. Requests and waiting tasks first, so they line up as closely as possible.
@@ -1024,12 +1110,48 @@ BEGIN
                     wt.wait_duration_ms DESC
             )
         FROM sys.dm_os_waiting_tasks AS wt
-        WHERE wt.session_id IS NOT NULL
-        AND   wt.session_id <> @@SPID;
+        /* Tasks that wait for a worker thread (THREADPOOL) have no session yet: keep them */
+        WHERE wt.session_id <> @@SPID
+        OR    (wt.session_id IS NULL AND wt.wait_type = N'THREADPOOL');
     END TRY
     BEGIN CATCH
         INSERT #messages (msg_type, section, message)
         VALUES ('ERROR', N'snapshot', LEFT(N'sys.dm_os_waiting_tasks: ' + ERROR_MESSAGE(), 4000));
+    END CATCH;
+
+    /* One row per session, read once. A correlated lookup re-reads the DMV for every session,
+       which is slow when thousands of sessions are connected. */
+    BEGIN TRY
+        INSERT #conn (session_id, client_net_address, connect_time, most_recent_sql_handle)
+        SELECT
+            x.session_id,
+            x.client_net_address,
+            x.connect_time,
+            x.most_recent_sql_handle
+        FROM
+        (
+            SELECT
+                ec.session_id,
+                ec.client_net_address,
+                ec.connect_time,
+                ec.most_recent_sql_handle,
+                conn_rank =
+                    ROW_NUMBER() OVER
+                    (
+                        PARTITION BY
+                            ec.session_id
+                        ORDER BY
+                            CASE WHEN ec.parent_connection_id IS NULL THEN 0 ELSE 1 END,
+                            ec.connect_time
+                    )
+            FROM sys.dm_exec_connections AS ec
+            WHERE ec.session_id IS NOT NULL
+        ) AS x
+        WHERE x.conn_rank = 1;
+    END TRY
+    BEGIN CATCH
+        INSERT #messages (msg_type, section, message)
+        VALUES ('INFO', N'snapshot', LEFT(N'sys.dm_exec_connections unavailable, client addresses omitted: ' + ERROR_MESSAGE(), 4000));
     END CATCH;
 
     BEGIN TRY
@@ -1068,62 +1190,13 @@ BEGIN
             s.group_id,
             c.most_recent_sql_handle
         FROM sys.dm_exec_sessions AS s
-        OUTER APPLY
-        (
-            SELECT TOP (1)
-                ec.client_net_address,
-                ec.connect_time,
-                ec.most_recent_sql_handle
-            FROM sys.dm_exec_connections AS ec
-            WHERE ec.session_id = s.session_id
-            ORDER BY
-                CASE WHEN ec.parent_connection_id IS NULL THEN 0 ELSE 1 END,
-                ec.connect_time
-        ) AS c
+        LEFT JOIN #conn AS c
+          ON c.session_id = s.session_id
         WHERE s.session_id <> @@SPID;
     END TRY
     BEGIN CATCH
         INSERT #messages (msg_type, section, message)
-        VALUES ('INFO', N'snapshot', LEFT(N'sys.dm_exec_connections unavailable, client addresses omitted: ' + ERROR_MESSAGE(), 4000));
-
-        BEGIN TRY
-            INSERT #sess
-            (
-                session_id, database_id, is_user_process, status, login_name, host_name, program_name,
-                client_interface_name, login_time, last_request_start_time, last_request_end_time, cpu_time,
-                memory_usage_pages, reads, writes, logical_reads, page_server_reads, open_transaction_count,
-                transaction_isolation_level, lock_timeout, deadlock_priority, group_id
-            )
-            SELECT
-                s.session_id,
-                s.database_id,
-                s.is_user_process,
-                s.status,
-                s.login_name,
-                s.host_name,
-                s.program_name,
-                s.client_interface_name,
-                s.login_time,
-                s.last_request_start_time,
-                s.last_request_end_time,
-                s.cpu_time,
-                s.memory_usage,
-                s.reads,
-                s.writes,
-                s.logical_reads,
-                s.page_server_reads,
-                s.open_transaction_count,
-                s.transaction_isolation_level,
-                s.lock_timeout,
-                s.deadlock_priority,
-                s.group_id
-            FROM sys.dm_exec_sessions AS s
-            WHERE s.session_id <> @@SPID;
-        END TRY
-        BEGIN CATCH
-            INSERT #messages (msg_type, section, message)
-            VALUES ('ERROR', N'snapshot', LEFT(N'sys.dm_exec_sessions: ' + ERROR_MESSAGE(), 4000));
-        END CATCH;
+        VALUES ('ERROR', N'snapshot', LEFT(N'sys.dm_exec_sessions: ' + ERROR_MESSAGE(), 4000));
     END CATCH;
 
     BEGIN TRY
@@ -1304,58 +1377,84 @@ BEGIN
 
             IF EXISTS (SELECT 1/0 FROM #blk_edges)
             BEGIN
-                WITH
-                    heads AS
+                /* Breadth-first from the head blockers. Each session appears once, under the blocker
+                   it has waited on longest among those placed one level up. Following every edge
+                   would list every path, and the number of paths grows exponentially when sessions
+                   have several blockers (latch convoys, parallel queries). */
+                INSERT #blk_nodes (node_order, session_id, blocked_by, head_session_id, lvl, is_head, in_cycle, sort_path)
+                SELECT
+                    0,
+                    h.session_id,
+                    NULL,
+                    h.session_id,
+                    0,
+                    1,
+                    0,
+                    RIGHT('0000000' + CONVERT(varchar(12), h.session_id + 100000), 7)
+                FROM
+                (
+                    SELECT DISTINCT
+                        session_id = e.blocker
+                    FROM #blk_edges AS e
+                    WHERE NOT EXISTS
                     (
-                        SELECT DISTINCT
-                            session_id = e.blocker
+                        SELECT
+                            1/0
+                        FROM #blk_edges AS e2
+                        WHERE e2.waiter = e.blocker
+                    )
+                ) AS h;
+
+                SET @blk_rows = @@ROWCOUNT;
+
+                WHILE @blk_rows > 0 AND @blk_lvl < @blk_max_lvl
+                BEGIN
+                    INSERT #blk_nodes (node_order, session_id, blocked_by, head_session_id, lvl, is_head, in_cycle, sort_path)
+                    SELECT
+                        0,
+                        x.waiter,
+                        x.blocker,
+                        x.head_session_id,
+                        @blk_lvl + 1,
+                        0,
+                        0,
+                        x.sort_path + '/' + RIGHT('0000000' + CONVERT(varchar(12), x.waiter + 100000), 7)
+                    FROM
+                    (
+                        SELECT
+                            e.waiter,
+                            e.blocker,
+                            p.head_session_id,
+                            p.sort_path,
+                            pick = ROW_NUMBER() OVER (PARTITION BY e.waiter ORDER BY e.wait_ms DESC, e.blocker)
                         FROM #blk_edges AS e
+                        JOIN #blk_nodes AS p
+                          ON  p.session_id = e.blocker
+                          AND p.lvl = @blk_lvl
                         WHERE NOT EXISTS
                         (
                             SELECT
                                 1/0
-                            FROM #blk_edges AS e2
-                            WHERE e2.waiter = e.blocker
+                            FROM #blk_nodes AS n
+                            WHERE n.session_id = e.waiter
                         )
-                    ),
-                    tree AS
+                    ) AS x
+                    WHERE x.pick = 1;
+
+                    SELECT
+                        @blk_rows = @@ROWCOUNT,
+                        @blk_lvl += 1;
+                END;
+
+                IF @blk_rows > 0
+                    INSERT #messages (msg_type, section, message)
+                    VALUES
                     (
-                        SELECT
-                            session_id = h.session_id,
-                            blocked_by = CONVERT(int, NULL),
-                            head_session_id = h.session_id,
-                            lvl = 0,
-                            sort_path = CONVERT(varchar(8000), RIGHT('0000000' + CONVERT(varchar(12), h.session_id + 100000), 7))
-                        FROM heads AS h
+                        'INFO', N'blocking',
+                        CONCAT(N'The blocking chain is deeper than ', @blk_max_lvl, N' levels. Sessions below that level are listed as CYCLE? at the end of blocking_tree.')
+                    );
 
-                        UNION ALL
-
-                        SELECT
-                            e.waiter,
-                            e.blocker,
-                            t.head_session_id,
-                            t.lvl + 1,
-                            CONVERT(varchar(8000), t.sort_path + '/' + RIGHT('0000000' + CONVERT(varchar(12), e.waiter + 100000), 7))
-                        FROM tree AS t
-                        JOIN #blk_edges AS e
-                          ON e.blocker = t.session_id
-                        WHERE t.lvl < 50
-                        AND   CHARINDEX('/' + RIGHT('0000000' + CONVERT(varchar(12), e.waiter + 100000), 7) + '/', '/' + t.sort_path + '/') = 0
-                    )
-                INSERT #blk_nodes (node_order, session_id, blocked_by, head_session_id, lvl, is_head, in_cycle, sort_path)
-                SELECT
-                    0,
-                    t.session_id,
-                    t.blocked_by,
-                    t.head_session_id,
-                    t.lvl,
-                    CASE WHEN t.lvl = 0 THEN 1 ELSE 0 END,
-                    0,
-                    t.sort_path
-                FROM tree AS t
-                OPTION (MAXRECURSION 100);
-
-                /* Sessions that are blocked but not reachable from a head blocker: blocking cycle */
+                /* Sessions that are blocked but not reachable from a head blocker: in a blocking cycle or behind one */
                 INSERT #blk_nodes (node_order, session_id, blocked_by, head_session_id, lvl, is_head, in_cycle, sort_path)
                 SELECT
                     0,
@@ -1382,9 +1481,9 @@ BEGIN
                     n.session_id,
                     (
                         SELECT
-                            COUNT(DISTINCT e.waiter)
-                        FROM #blk_edges AS e
-                        WHERE e.blocker = n.session_id
+                            COUNT(*)
+                        FROM #blk_nodes AS c
+                        WHERE c.blocked_by = n.session_id
                     ),
                     ISNULL(d.total_blocked, 0),
                     d.max_wait_ms
@@ -1882,10 +1981,11 @@ BEGIN
                     END,
                 session_id = n.session_id,
                 blocked_by = n.blocked_by,
+                also_blocked_by = ob.also_blocked_by,
                 head_blocker = n.head_session_id,
                 role =
                     CASE
-                        WHEN n.in_cycle = 1 THEN N'IN A BLOCKING CYCLE (no head). Deadlock detection should resolve it; if it persists, investigate.'
+                        WHEN n.in_cycle = 1 THEN N'IN OR BEHIND A BLOCKING CYCLE (no head blocker). Deadlock detection should resolve it; if it persists, investigate.'
                         WHEN n.session_id = -2 THEN N'HEAD BLOCKER - orphaned distributed transaction'
                         WHEN n.session_id = -3 THEN N'HEAD BLOCKER - deferred recovery transaction'
                         WHEN n.session_id = -4 THEN N'HEAD BLOCKER - latch owner unknown (latch state transition)'
@@ -1983,6 +2083,15 @@ BEGIN
               ON wr.resource_text = r.wait_resource
             LEFT JOIN #head_locks AS hl
               ON hl.session_id = n.session_id
+            OUTER APPLY
+            (
+                SELECT
+                    also_blocked_by =
+                        LEFT(STRING_AGG(CONVERT(nvarchar(max), e.blocker), N', ') WITHIN GROUP (ORDER BY e.wait_ms DESC, e.blocker), 400)
+                FROM #blk_edges AS e
+                WHERE e.waiter = n.session_id
+                AND   e.blocker <> n.blocked_by
+            ) AS ob
             LEFT JOIN #ib AS ib
               ON ib.session_id = n.session_id
             OUTER APPLY
@@ -2286,7 +2395,7 @@ BEGIN
             @t0 = SYSDATETIME();
 
         INSERT #emit (section_order, section_key, result_key, result_name, table_name, empty_message)
-        VALUES (400, N'waits', @rk, N'WAITING RIGHT NOW (tasks in this database, by wait type)', N'#o_waits_now', N'No user tasks are waiting right now.');
+        VALUES (400, N'waits', @rk, N'WAITING RIGHT NOW (tasks in this database by wait type, plus tasks that wait for a worker thread)', N'#o_waits_now', N'No user tasks are waiting right now.');
 
         BEGIN TRY
             WITH
@@ -2300,14 +2409,22 @@ BEGIN
                         wt.resource_description,
                         rnk = ROW_NUMBER() OVER (PARTITION BY wt.wait_type ORDER BY wt.wait_duration_ms DESC, wt.session_id)
                     FROM #wt AS wt
-                    JOIN #sess AS s
+                    LEFT JOIN #sess AS s
                       ON s.session_id = wt.session_id
                     WHERE wt.task_rank = 1
-                    AND   s.database_id = @db_id
                     AND
                     (
-                        s.is_user_process = 1
-                        OR EXISTS (SELECT 1/0 FROM #blk_nodes AS bn WHERE bn.session_id = wt.session_id)
+                        /* THREADPOOL waiters have no session yet */
+                        (wt.session_id IS NULL AND wt.wait_type = N'THREADPOOL')
+                        OR
+                        (
+                            s.database_id = @db_id
+                            AND
+                            (
+                                s.is_user_process = 1
+                                OR EXISTS (SELECT 1/0 FROM #blk_nodes AS bn WHERE bn.session_id = wt.session_id)
+                            )
+                        )
                     )
                     AND NOT EXISTS
                     (
@@ -3593,7 +3710,7 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                 version_store_mb = CONVERT(decimal(18, 2), t.version_store_mb),
                 interpretation =
                     CASE
-                        WHEN t.file_type = N'log' AND t.used_mb >= 0.70 * t.size_mb
+                        WHEN t.file_type = N'log' AND t.used_mb >= 0.70 * ISNULL(t.max_size_mb, t.size_mb)
                         THEN N'tempdb log is filling: an open transaction that uses tempdb (large temp table load, sort or long batch) prevents truncation. See tempdb_sessions and open_transactions.'
                         WHEN t.file_type = N'log'
                         THEN N'OK'
@@ -4014,7 +4131,7 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
             @t0 = SYSDATETIME();
 
         INSERT #emit (section_order, section_key, result_key, result_name, table_name, empty_message)
-        VALUES (820, N'transactions', @rk, N'TRANSACTION LOG (space, truncation holdup and log rate)', N'#o_log_usage', N'No transaction log information available.');
+        VALUES (820, N'transactions', @rk, N'TRANSACTION LOG (space against the maximum log size, truncation holdup and log rate)', N'#o_log_usage', N'No transaction log information available.');
 
         BEGIN TRY
             SELECT
@@ -4025,6 +4142,8 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                 log_size_mb = CONVERT(decimal(18, 2), lsu.total_log_size_in_bytes / 1048576.0),
                 log_used_mb = CONVERT(decimal(18, 2), lsu.used_log_space_in_bytes / 1048576.0),
                 log_used_pct = CONVERT(decimal(9, 1), lsu.used_log_space_in_percent),
+                log_max_mb = CONVERT(decimal(18, 2), @log_max_mb),
+                log_used_pct_of_max = CONVERT(decimal(9, 1), lm.pct_of_max),
                 active_log_mb = CONVERT(decimal(18, 2), ls.active_log_size_mb),
                 log_since_last_backup_mb = CONVERT(decimal(18, 2), ls.log_since_last_log_backup_mb),
                 log_since_last_checkpoint_mb = CONVERT(decimal(18, 2), ls.log_since_last_checkpoint_mb),
@@ -4036,14 +4155,14 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                 log_rate_limit_mbps = @rg_max_log_rate_mbps,
                 interpretation =
                     CASE
-                        WHEN lsu.used_log_space_in_percent >= 70 AND d.log_reuse_wait_desc = N'ACTIVE_TRANSACTION'
+                        WHEN lp.fill_pct >= 70 AND d.log_reuse_wait_desc = N'ACTIVE_TRANSACTION'
                         THEN N'The log is filling because a long-running transaction prevents truncation. Find it in open_transactions (oldest first) and commit or roll it back.'
-                        WHEN lsu.used_log_space_in_percent >= 70 AND d.log_reuse_wait_desc = N'LOG_BACKUP'
+                        WHEN lp.fill_pct >= 70 AND d.log_reuse_wait_desc = N'LOG_BACKUP'
                         THEN N'The log is waiting for the next automatic log backup. Usually transient in Azure SQL Database; if it persists, open a support case.'
-                        WHEN lsu.used_log_space_in_percent >= 70 AND d.log_reuse_wait_desc IN (N'AVAILABILITY_REPLICA', N'DATABASE_MIRRORING')
+                        WHEN lp.fill_pct >= 70 AND d.log_reuse_wait_desc IN (N'AVAILABILITY_REPLICA', N'DATABASE_MIRRORING')
                         THEN N'The log is retained for a replica (HA or geo-secondary) that is behind. See replicas.'
-                        WHEN lsu.used_log_space_in_percent >= 70
-                        THEN CONCAT(N'The log is ', CONVERT(decimal(9, 1), lsu.used_log_space_in_percent), N'% used; truncation waits on ', d.log_reuse_wait_desc COLLATE DATABASE_DEFAULT, N'.')
+                        WHEN lp.fill_pct >= 70
+                        THEN CONCAT(N'The log is ', CONVERT(decimal(9, 1), lp.fill_pct), N'% used; truncation waits on ', d.log_reuse_wait_desc COLLATE DATABASE_DEFAULT, N'.')
                         WHEN rs.avg_log_write_percent >= 90
                         THEN N'Log generation is at the service objective log rate limit (LOG_RATE_GOVERNOR waits). Batch large modifications, move index maintenance off peak, or scale up.'
                         ELSE N'OK'
@@ -4053,6 +4172,22 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
             OUTER APPLY sys.dm_db_log_stats(d.database_id) AS ls
             LEFT JOIN sys.dm_db_log_space_usage AS lsu
               ON lsu.database_id = d.database_id
+            /* The log file grows on demand: judge how full the log is against its maximum size,
+               and against the current file only when the maximum is not known. */
+            CROSS APPLY
+            (
+                SELECT
+                    pct_of_max =
+                        CASE
+                            WHEN @log_max_mb * 1048576.0 >= lsu.total_log_size_in_bytes
+                            THEN 100.0 * lsu.used_log_space_in_bytes / (@log_max_mb * 1048576.0)
+                        END
+            ) AS lm
+            CROSS APPLY
+            (
+                SELECT
+                    fill_pct = ISNULL(lm.pct_of_max, lsu.used_log_space_in_percent)
+            ) AS lp
             OUTER APPLY
             (
                 SELECT TOP (1)
@@ -5531,7 +5666,7 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                             END)), N'; '), 4000)
                 FROM sys.database_event_sessions AS des
                 LEFT JOIN sys.dm_xe_database_sessions AS ds
-                  ON ds.name = des.name
+                  ON ds.name COLLATE DATABASE_DEFAULT = des.name COLLATE DATABASE_DEFAULT
                 WHERE EXISTS
                 (
                     SELECT
@@ -5786,7 +5921,8 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
 
     /* ============================================================================================
        1400 stale_statistics (slow): statistics with the most changes since their last update.
-       Auto-update threshold (compatibility level 130+): MIN(500 + 20% of rows, SQRT(1000 * rows)).
+       Auto-update threshold: MIN(500 + 20% of rows, SQRT(1000 * rows)) from compatibility level
+       130, and 500 + 20% of rows below it.
        ============================================================================================ */
     IF @do_stats = 1
     BEGIN
@@ -5820,7 +5956,7 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                         threshold =
                             CASE
                                 WHEN ISNULL(sp.rows, 0) <= 500 THEN 500.0
-                                WHEN SQRT(1000.0 * sp.rows) < 500 + 0.20 * sp.rows THEN SQRT(1000.0 * sp.rows)
+                                WHEN ISNULL(@compat_level, 130) >= 130 AND SQRT(1000.0 * sp.rows) < 500 + 0.20 * sp.rows THEN SQRT(1000.0 * sp.rows)
                                 ELSE 500 + 0.20 * sp.rows
                             END
                     FROM sys.stats AS s
@@ -6525,7 +6661,10 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         @f_data_max_mb decimal(19, 1),
         @f_data_pct decimal(9, 2),
         @f_log_used_pct decimal(9, 2),
+        @f_log_file_pct decimal(9, 2),
+        @f_log_used_mb decimal(19, 1),
         @f_log_size_mb decimal(19, 1),
+        @f_log_basis nvarchar(200),
         @f_log_reuse_wait nvarchar(60),
         @f_updateability nvarchar(30),
         @f_auto_create_stats bit,
@@ -6734,9 +6873,25 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
             SET @f_data_pct = 100.0 * @f_data_used_mb / NULLIF(@f_data_max_mb, 0);
 
             SELECT TOP (1)
-                @f_log_used_pct = l.used_log_space_in_percent,
+                @f_log_file_pct = l.used_log_space_in_percent,
+                @f_log_used_mb = l.used_log_space_in_bytes / 1048576.0,
                 @f_log_size_mb = l.total_log_size_in_bytes / 1048576.0
             FROM sys.dm_db_log_space_usage AS l;
+
+            /* Percent of the maximum log size when it is known: the log file grows on demand, so a
+               small file that is nearly full is not a log that is nearly full. */
+            SELECT
+                @f_log_used_pct =
+                    CASE
+                        WHEN @log_max_mb >= @f_log_size_mb THEN 100.0 * @f_log_used_mb / @log_max_mb
+                        ELSE @f_log_file_pct
+                    END,
+                @f_log_basis =
+                    CASE
+                        WHEN @log_max_mb >= @f_log_size_mb
+                        THEN CONCAT(N'the ', @log_max_mb, N' MB maximum log size (the log file is ', @f_log_size_mb, N' MB now, ', @f_log_file_pct, N'% used)')
+                        ELSE CONCAT(N'the ', @f_log_size_mb, N' MB log file (maximum log size not known)')
+                    END;
 
             SELECT
                 @f_log_reuse_wait = d.log_reuse_wait_desc,
@@ -7080,7 +7235,8 @@ AND   mh.severity_level >= 3;';
             SELECT
                 @f_threadpool_tasks = COUNT(*)
             FROM #wt AS w
-            WHERE w.wait_type = N'THREADPOOL';
+            WHERE w.wait_type = N'THREADPOOL'
+            AND   w.task_rank = 1;
         END TRY
         BEGIN CATCH
             INSERT #messages (msg_type, section, message)
@@ -7576,8 +7732,8 @@ AND   mh.severity_level >= 3;';
                 (
                     CASE WHEN @f_blk_cycle > 0 THEN 3 END,
                     N'Blocking',
-                    N'Sessions are blocked in a cycle with no head blocker',
-                    CONCAT(@f_blk_cycle, N' session(s) form a blocking cycle (listed at the end of blocking_tree)'),
+                    N'Sessions are blocked in or behind a cycle with no head blocker',
+                    CONCAT(@f_blk_cycle, N' session(s) are in or behind a blocking cycle (listed at the end of blocking_tree)'),
                     N'A lock deadlock is resolved by the deadlock monitor within seconds; a cycle that persists usually involves parallel query threads or a resource SQL Server cannot see. Re-run to confirm and check deadlocks.',
                     N'blocking_tree, deadlocks'
                 ),
@@ -7658,12 +7814,21 @@ AND   mh.severity_level >= 3;';
                     N'governance, configuration'
                 ),
                 (
-                    CASE WHEN @f_log_used_pct >= 90 THEN 2 WHEN @f_log_used_pct >= 70 THEN 3 END,
+                    CASE
+                        WHEN @f_log_used_pct >= 90 THEN 2
+                        WHEN @f_log_used_pct >= 70 THEN 3
+                        WHEN @f_log_file_pct >= 90
+                        AND  @f_log_reuse_wait NOT IN (N'NOTHING', N'CHECKPOINT', N'LOG_BACKUP', N'ACTIVE_BACKUP_OR_RESTORE')
+                        THEN 4
+                    END,
                     N'Log space',
-                    N'The transaction log is filling up',
+                    CASE
+                        WHEN @f_log_used_pct >= 70 THEN N'The transaction log is filling up'
+                        ELSE N'The log file is nearly full at its current size and truncation is held up (the file can still grow)'
+                    END,
                     CONCAT
                     (
-                        N'log used ', CONVERT(decimal(9, 1), @f_log_used_pct), N'% of ', @f_log_size_mb, N' MB; log_reuse_wait_desc ', ISNULL(@f_log_reuse_wait, N'n/a'),
+                        N'log used ', @f_log_used_mb, N' MB, ', CONVERT(decimal(9, 1), @f_log_used_pct), N'% of ', @f_log_basis, N'; log_reuse_wait_desc ', ISNULL(@f_log_reuse_wait, N'n/a'),
                         CASE WHEN @f_tran_oldest_s >= 60 THEN CONCAT(N'; oldest transaction ', @f_tran_oldest_s, N' s (session ', @f_tran_oldest_session, N')') END
                     ),
                     N'The log cannot be truncated past the reason in log_reuse_wait_desc. ACTIVE_TRANSACTION: end the oldest transaction. AVAILABILITY_REPLICA: a replica or geo-secondary is behind. REPLICATION: CDC or replication is not keeping up. When the log is full every write fails (error 9002).',
@@ -8197,7 +8362,7 @@ AND   mh.severity_level >= 3;';
                 ),
                 (
                     17, N'log', CONVERT(nvarchar(30), @f_log_used_pct) + N'%',
-                    CONCAT(N'of ', ISNULL(CONVERT(nvarchar(30), @f_log_size_mb), N'n/a'), N' MB in use; log_reuse_wait_desc ', ISNULL(@f_log_reuse_wait, N'n/a'))
+                    CONCAT(N'of ', ISNULL(@f_log_basis, N'n/a'), N' in use; log_reuse_wait_desc ', ISNULL(@f_log_reuse_wait, N'n/a'))
                 ),
                 (
                     18, N'version_store', CONVERT(nvarchar(30), @f_pvs_mb) + N' MB',
