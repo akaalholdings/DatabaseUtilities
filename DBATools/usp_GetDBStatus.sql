@@ -5,7 +5,7 @@ SET QUOTED_IDENTIFIER ON
 GO
 
 /*
-    DBATools.usp_GetDBStatus 2.1.3 (2026-11-19)
+    DBATools.usp_GetDBStatus 2.2.0 (2026-11-19)
 
     Purpose        Shows what is happening on one Azure SQL Database now: health summary and
                    findings, blocking, requests, waits, resources, memory, tempdb, transactions,
@@ -22,14 +22,14 @@ GO
     Help           EXEC DBATools.usp_GetDBStatus @help = 1;
 
     Test after deploy
-    Run these four commands in the database. The MESSAGES result (the last one) must hold no
+    Run these five commands in the database. The MESSAGES result (the last one) must hold no
     ERROR row.
 
         -- 1. Default run. @debug = 1 adds the time of each result to MESSAGES.
         EXEC DBATools.usp_GetDBStatus @debug = 1;
 
         -- 2. Every slow section, with deltas measured over 10 seconds.
-        EXEC DBATools.usp_GetDBStatus @effort = 'slow', @sample_seconds = 10;
+        EXEC DBATools.usp_GetDBStatus @effort = 'slow', @sample_seconds = 10, @debug = 1;
 
         -- 3. JSON output. Each result is one JSON document. To test the blocking tree, hold an
         --    open UPDATE in one session and block two other sessions behind it: blocking_tree
@@ -38,6 +38,48 @@ GO
 
         -- 4. log_usage: log_max_mb must be a plausible log limit for the service objective.
         EXEC DBATools.usp_GetDBStatus @section = 'transactions';
+
+        -- 5. Plans and plan forcing: requests gets query_plan and plan_parameters, and plan_forcing
+        --    lists forced plans and Query Store hints.
+        EXEC DBATools.usp_GetDBStatus @section = 'requests,config', @include_plans = 1, @debug = 1;
+
+        -- 6. Optional: blocking_history and the blocking tree with real blocking.
+        --    Create the session once (up to 4 MB of memory, it keeps the most recent events):
+        --        CREATE EVENT SESSION [blocking] ON DATABASE
+        --            ADD EVENT sqlserver.blocked_process_report
+        --            ADD TARGET package0.ring_buffer
+        --            WITH (STARTUP_STATE = ON, MAX_MEMORY = 4 MB);
+        --        ALTER EVENT SESSION [blocking] ON DATABASE STATE = START;
+        --    Session A: BEGIN TRANSACTION, then UPDATE one row of a test table. Do not commit.
+        --    Session B: UPDATE the same row. It waits.
+        --    After 30 seconds or more, run command 2 in a third session: blocking_tree must show
+        --    session A as HEAD and session B under it, and blocking_history must list the block
+        --    when the service has raised a report. Then ROLLBACK in session A.
+        --    To remove the session: DROP EVENT SESSION [blocking] ON DATABASE;
+
+    When you report a problem, send the full output of commands 2 and 5 (all results and the
+    Messages tab). Remove real names first.
+
+    Changes in 2.2.0
+    Ideas for these checks come from the First Responder Kit (Brent Ozar Unlimited), DarlingData
+    (Erik Darling) and FreeSQLServerScripts (Kendra Little). No code was copied.
+    - plan_forcing (config section): forced plans and Query Store hints, those that failed to
+      apply first, with the command that unforces the plan or clears the hint. Finding
+      PLAN_FORCING_FAILED.
+    - New findings: a request that is rolling back; identity columns at 90 % or more of their
+      range; client cancellations during the sample; slow data file reads; waits for compile
+      memory; IO retries; recompilation rate; engine started in the last 60 minutes; statistics
+      updated in the last 15 minutes (stats section).
+    - Idle transactions: the evidence counts implicit transactions.
+    - requests: plan_parameters (compiled and runtime parameter values) with @include_plans = 1.
+    - blocking_tree: notes column with the likely cause (compile lock, schema lock, range lock,
+      reader blocked by writer, isolation level of the blocker, implicit transactions).
+    - blocking_history (blocking section, slow effort): blocks reported by blocked_process_report
+      events in a database Extended Events session, including blocks that have ended.
+    - plan_cache_sampled (queries section, with @sample_seconds): statements that completed during
+      the sample, by CPU and by executions.
+    - query_store_top: note when the CPU of one plan differs widely between executions.
+    - findings: a stable code for each finding (column code).
 
     Changes in 2.1.3 (from the run of 2.1.2 on Azure SQL Database)
     - New finding: a query that has held a memory grant of 1 GB or more for at least 60 seconds
@@ -105,7 +147,7 @@ BEGIN
     SET DEADLOCK_PRIORITY LOW;
 
     SELECT
-        @version = '2.1.3',
+        @version = '2.2.0',
         @version_date = '20261119';
 
     /* ============================================================================================
@@ -113,7 +155,7 @@ BEGIN
        ============================================================================================ */
     IF @help = 1
     BEGIN
-        PRINT N'DBATools.usp_GetDBStatus v2.1.3 - what is happening on this Azure SQL Database right now.';
+        PRINT N'DBATools.usp_GetDBStatus v2.2.0 - what is happening on this Azure SQL Database right now.';
         PRINT N'Run it in the database you want to inspect. Everything it does is read-only.';
 
         SELECT
@@ -131,7 +173,7 @@ BEGIN
                 (5, N'@top_n', N'int', N'25', N'Rows returned by each top-N list (1-1000).'),
                 (6, N'@long_running_seconds', N'int', N'30', N'Requests running at least this long are flagged as long running.'),
                 (7, N'@lookback_minutes', N'int', N'60', N'Window used for plan cache, Query Store and deadlock history (1-1440).'),
-                (8, N'@include_plans', N'bit', N'0', N'1 = return query plans for requests and top queries (live in-flight plan when available). Adds overhead.'),
+                (8, N'@include_plans', N'bit', N'0', N'1 = return query plans for requests and top queries (live in-flight plan when available), and the compiled and runtime parameter values of running requests. Adds overhead.'),
                 (9, N'@help', N'bit', N'0', N'1 = show this help and exit.'),
                 (10, N'@debug', N'bit', N'0', N'1 = print generated SQL and report the timing of every result in MESSAGES.'),
                 (11, N'@version', N'varchar(30) OUTPUT', N'NULL', N'Returns the procedure version.'),
@@ -148,8 +190,8 @@ BEGIN
         FROM
         (
             VALUES
-                (1, N'summary', N'fast', N'summary, findings', N'Health rollup (CRITICAL / WARNING / ATTENTION / OK) and prioritized findings with evidence and next steps. Alias: findings.'),
-                (2, N'blocking', N'fast', N'blocking_tree', N'Who blocks whom: head blockers first, sleeping blockers with open transactions, decoded wait resources, locks held by head blockers.'),
+                (1, N'summary', N'fast', N'summary, findings', N'Health rollup (CRITICAL / WARNING / ATTENTION / OK) and prioritized findings with evidence, next steps and a stable code. Alias: findings.'),
+                (2, N'blocking', N'fast', N'blocking_tree, blocking_history (slow)', N'Who blocks whom: head blockers first, sleeping blockers with open transactions, decoded wait resources, locks held by head blockers, likely cause. With @effort = slow: blocks that the service reported in a database XE session (blocked_process_report, ring_buffer target), including blocks that have ended.'),
                 (3, N'requests', N'fast', N'requests', N'Active requests: elapsed, waits, CPU/reads (and deltas when sampled), memory grant, tempdb, transaction, statement and input buffer.'),
                 (4, N'waits', N'fast', N'waits_now, wait_stats, session_waits_sampled (sampled), index_lock_waits', N'Current waits, database wait stats (cumulative or sampled delta) with categories and explanations, session waits during the sample (requests that still run included), and lock/latch waits by index.'),
                 (5, N'resources', N'fast', N'resource_stats, resource_samples (slow), governance, schedulers, workload_group, perf_counters', N'Service-objective utilization (dm_db_resource_stats), resource governance limits, workers, schedulers and key performance counters.'),
@@ -157,9 +199,9 @@ BEGIN
                 (7, N'tempdb', N'fast', N'tempdb_space, tempdb_sessions', N'tempdb space by consumer type and the sessions using the most tempdb.'),
                 (8, N'transactions', N'fast', N'open_transactions, version_store, log_usage, replicas', N'Open transactions (oldest first), version store health (ADR persistent version store and tempdb) and what holds cleanup back, transaction log usage and truncation holdups, HA replica state and geo-replication links.'),
                 (9, N'io', N'fast', N'file_io', N'File IO latency for data, log and tempdb (Hyperscale: page servers and local SSD cache), including Azure IO governance queuing (cumulative or sampled delta).'),
-                (10, N'queries', N'fast', N'plan_cache_top', N'Top statements in the plan cache by CPU and by reads, aggregated by query_hash, executed within @lookback_minutes. Alias: plancache.'),
+                (10, N'queries', N'fast', N'plan_cache_top, plan_cache_sampled (sampled)', N'Top statements in the plan cache by CPU and by reads, aggregated by query_hash, executed within @lookback_minutes. With @sample_seconds: the statements that completed during the sample. Alias: plancache.'),
                 (11, N'sessions', N'fast', N'sessions_by_app', N'User sessions grouped by program, host and login: running, sleeping, blocked, blocking and idle-in-transaction counts.'),
-                (12, N'config', N'fast', N'configuration, tuning_recommendations', N'Service objective, database options, database scoped configurations, automatic tuning and Query Store options, plus automatic tuning recommendations (plan regressions and index suggestions).'),
+                (12, N'config', N'fast', N'configuration, tuning_recommendations, plan_forcing', N'Service objective, database options, database scoped configurations, automatic tuning and Query Store options, automatic tuning recommendations (plan regressions and index suggestions), and forced plans and Query Store hints with those that failed to apply.'),
                 (13, N'querystore', N'slow', N'query_store_top, query_store_waits', N'Query Store top queries (aggregated per query) and wait categories within @lookback_minutes. Alias: qs.'),
                 (14, N'deadlocks', N'slow', N'deadlocks', N'Deadlock graphs from a running database XE session with a ring_buffer target. Prints a setup script when none exists.'),
                 (15, N'stats', N'slow', N'stale_statistics', N'Statistics with the most modifications relative to their auto-update threshold.'),
@@ -401,7 +443,8 @@ BEGIN
         finding nvarchar(400) COLLATE DATABASE_DEFAULT NOT NULL,
         evidence nvarchar(2000) COLLATE DATABASE_DEFAULT NULL,
         recommended_action nvarchar(2000) COLLATE DATABASE_DEFAULT NULL,
-        see_section nvarchar(100) COLLATE DATABASE_DEFAULT NULL
+        see_section nvarchar(100) COLLATE DATABASE_DEFAULT NULL,
+        code nvarchar(40) COLLATE DATABASE_DEFAULT NULL /* stable id of the check: the text of a finding changes, the code does not */
     );
 
     CREATE TABLE #emit
@@ -621,6 +664,18 @@ BEGIN
         instance_name nvarchar(128) COLLATE DATABASE_DEFAULT NULL,
         cntr_value bigint NULL,
         cntr_type int NULL
+    );
+
+    CREATE TABLE #qs_s1
+    (
+        plan_handle varbinary(64) NOT NULL,
+        statement_start_offset int NOT NULL,
+        statement_end_offset int NOT NULL,
+        creation_time datetime NULL,
+        execution_count bigint NULL,
+        total_worker_time bigint NULL,
+        total_elapsed_time bigint NULL,
+        total_logical_reads bigint NULL
     );
 
     CREATE TABLE #req_sample1
@@ -1021,11 +1076,12 @@ BEGIN
                     N'Lazy writes/sec', N'Readahead pages/sec', N'Memory Grants Pending', N'Memory Grants Outstanding',
                     N'Target Server Memory (KB)', N'Total Server Memory (KB)', N'Full Scans/sec', N'Index Searches/sec',
                     N'Page Splits/sec', N'Forwarded Records/sec', N'Workfiles Created/sec', N'Worktables Created/sec',
-                    N'Free Space in tempdb (KB)', N'Version Store Size (KB)', N'Longest Transaction Running Time'
+                    N'Free Space in tempdb (KB)', N'Version Store Size (KB)', N'Longest Transaction Running Time',
+                    N'SQL Attention rate'
                 )
                 OR
                 (
-                    pc.counter_name IN (N'Lock Waits/sec', N'Number of Deadlocks/sec', N'Lock Timeouts (timeout > 0)/sec')
+                    pc.counter_name IN (N'Lock Waits/sec', N'Number of Deadlocks/sec', N'Lock Timeouts (timeout > 0)/sec', N'Errors/sec')
                     AND pc.instance_name = N'_Total'
                 )
                 OR
@@ -1094,6 +1150,32 @@ AND   sw.wait_time_ms > 0;',
                 INSERT #messages (msg_type, section, message)
                 VALUES ('ERROR', N'snapshot', LEFT(N'sys.dm_exec_requests (sample 1): ' + ERROR_MESSAGE(), 4000));
             END CATCH;
+
+            /* Plan cache counters at the start of the sample, for plan_cache_sampled */
+            IF @is_sampled = 1 AND @do_queries = 1
+            BEGIN
+                BEGIN TRY
+                    INSERT #qs_s1
+                    (
+                        plan_handle, statement_start_offset, statement_end_offset, creation_time,
+                        execution_count, total_worker_time, total_elapsed_time, total_logical_reads
+                    )
+                    SELECT
+                        qs.plan_handle,
+                        qs.statement_start_offset,
+                        qs.statement_end_offset,
+                        qs.creation_time,
+                        qs.execution_count,
+                        qs.total_worker_time,
+                        qs.total_elapsed_time,
+                        qs.total_logical_reads
+                    FROM sys.dm_exec_query_stats AS qs;
+                END TRY
+                BEGIN CATCH
+                    INSERT #messages (msg_type, section, message)
+                    VALUES ('INFO', N'snapshot', LEFT(N'sys.dm_exec_query_stats (sample 1): ' + ERROR_MESSAGE(), 4000));
+                END CATCH;
+            END;
         END;
 
         SET @sample_no += 1;
@@ -2162,6 +2244,30 @@ WHERE d.deferred_pages > 0;';
                 program_name = s.program_name,
                 client_net_address = s.client_net_address,
                 locks_held = hl.locks_held,
+                notes =
+                    ISNULL(STUFF(CONCAT(
+                        /* why this session waits */
+                        CASE WHEN r.wait_resource LIKE N'%COMPILE%' THEN N'; waits for a compile lock: another session compiles the same procedure' END,
+                        CASE WHEN r.wait_type IN (N'LCK_M_SCH_M', N'LCK_M_SCH_S') THEN N'; schema lock: a DDL statement, index rebuild, partition switch or TRUNCATE is in the chain' END,
+                        CASE WHEN r.wait_type LIKE N'LCK[_]M[_]R%' THEN N'; range lock: a SERIALIZABLE transaction is in the chain' END,
+                        CASE
+                            WHEN r.wait_type IN (N'LCK_M_S', N'LCK_M_IS') AND @rcsi = 0
+                            THEN N'; a reader blocked by a writer: READ_COMMITTED_SNAPSHOT would remove this block'
+                            WHEN r.wait_type IN (N'LCK_M_S', N'LCK_M_IS') AND ISNULL(r.transaction_isolation_level, s.transaction_isolation_level) = 2
+                            THEN N'; a reader takes shared locks although RCSI is on: look for a locking hint (HOLDLOCK, READCOMMITTEDLOCK, TABLOCK)'
+                        END,
+                        CASE WHEN r.wait_type LIKE N'PAGELATCH%' OR r.wait_type LIKE N'LATCH%' THEN N'; latch wait, not a lock: contention on a page or an internal structure' END,
+                        /* why this session blocks others */
+                        CASE
+                            WHEN ISNULL(bc.total_blocked, 0) > 0 AND ISNULL(r.transaction_isolation_level, s.transaction_isolation_level) IN (3, 4)
+                            THEN N'; this blocker runs at REPEATABLE READ or SERIALIZABLE and keeps its shared locks until it commits'
+                        END,
+                        CASE
+                            WHEN ISNULL(bc.total_blocked, 0) > 0
+                            AND  EXISTS (SELECT 1/0 FROM #trn AS ti WHERE ti.session_id = n.session_id AND ti.transaction_name = N'implicit_transaction')
+                            THEN N'; this blocker uses implicit transactions (SET IMPLICIT_TRANSACTIONS ON): a transaction stays open until the application commits'
+                        END
+                    ), 1, 2, N''), N''),
                 statement_text =
                     CASE
                         WHEN r.sql_handle IS NOT NULL
@@ -2505,6 +2611,50 @@ WHERE d.deferred_pages > 0;';
                 INSERT #messages (msg_type, section, message)
                 VALUES ('INFO', N'requests', LEFT(N'Query plans for requests: ' + ERROR_MESSAGE(), 4000));
             END CATCH;
+
+            /* Parameter values from the plan: the values that the plan was compiled for and, in a
+               live plan, the values of this execution. A large difference in what the two select is
+               the sign of parameter sniffing. Dynamic SQL: the column is new at this point, and an
+               error there must become a message. */
+            IF COL_LENGTH(N'tempdb..#o_requests', N'query_plan') IS NOT NULL
+            BEGIN
+                BEGIN TRY
+                    ALTER TABLE #o_requests ADD plan_parameters nvarchar(max) NULL;
+
+                    EXEC sys.sp_executesql N'
+WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan'')
+UPDATE o
+SET o.plan_parameters = x.params
+FROM #o_requests AS o
+CROSS APPLY
+(
+    SELECT
+        params =
+            LEFT
+            (
+                STRING_AGG
+                (
+                    CONVERT(nvarchar(max), CONCAT(p.name, N'' compiled '', ISNULL(p.compiled_value, N''?''), N'', runtime '' + p.runtime_value)),
+                    N''; ''
+                ),
+                4000
+            )
+    FROM
+    (
+        SELECT DISTINCT
+            name = c.n.value(''@Column'', ''nvarchar(128)''),
+            compiled_value = c.n.value(''@ParameterCompiledValue'', ''nvarchar(400)''),
+            runtime_value = c.n.value(''@ParameterRuntimeValue'', ''nvarchar(400)'')
+        FROM o.query_plan.nodes(''//ParameterList/ColumnReference'') AS c (n)
+    ) AS p
+) AS x
+WHERE o.query_plan IS NOT NULL;';
+                END TRY
+                BEGIN CATCH
+                    INSERT #messages (msg_type, section, message)
+                    VALUES ('INFO', N'requests', LEFT(N'Plan parameters for requests: ' + ERROR_MESSAGE(), 4000));
+                END CATCH;
+            END;
         END;
 
         UPDATE #emit SET duration_ms = DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()) WHERE result_key = @rk;
@@ -3308,6 +3458,18 @@ WHERE d.deferred_pages > 0;';
         last_commit_utc datetime2(3) NULL,
         last_replication_utc datetime2(3) NULL,
         secondary_allow_connections nvarchar(60) COLLATE DATABASE_DEFAULT NULL
+    );
+
+    CREATE TABLE #forcing
+    (
+        kind nvarchar(20) COLLATE DATABASE_DEFAULT NOT NULL,
+        query_id bigint NOT NULL,
+        plan_id bigint NULL,
+        forcing_type nvarchar(60) COLLATE DATABASE_DEFAULT NULL,
+        failure_count bigint NULL,
+        last_failure_reason nvarchar(128) COLLATE DATABASE_DEFAULT NULL,
+        last_execution datetimeoffset(7) NULL,
+        hint_text nvarchar(max) COLLATE DATABASE_DEFAULT NULL
     );
 
     CREATE TABLE #plan_db
@@ -4941,6 +5103,160 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         END CATCH;
 
         UPDATE #emit SET duration_ms = DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()) WHERE result_key = @rk;
+
+        /* ---- 1005 plan_cache_sampled: what completed during the sample. The plan cache counters of a
+           statement change when an execution ends, so a statement that still runs is not here:
+           find it in requests. ---- */
+        IF @is_sampled = 1
+        BEGIN
+            SELECT
+                @rk = N'plan_cache_sampled',
+                @t0 = SYSDATETIME();
+
+            INSERT #emit (section_order, section_key, result_key, result_name, table_name, empty_message)
+            VALUES
+            (
+                1005, N'queries', @rk,
+                N'STATEMENTS THAT COMPLETED DURING THE SAMPLE OF ' + CONVERT(nvarchar(20), @sample_s) + N' s (top by CPU and by executions; a statement that still runs is in requests, not here)',
+                N'#o_plan_cache_sampled',
+                N'No statement of this database completed during the sample.'
+            );
+
+            BEGIN TRY
+                SELECT
+                    qs.query_hash,
+                    qs.plan_handle,
+                    qs.sql_handle,
+                    qs.statement_start_offset,
+                    qs.statement_end_offset,
+                    executions = qs.execution_count - ISNULL(s1.execution_count, 0),
+                    cpu_us = qs.total_worker_time - ISNULL(s1.total_worker_time, 0),
+                    elapsed_us = qs.total_elapsed_time - ISNULL(s1.total_elapsed_time, 0),
+                    logical_reads = qs.total_logical_reads - ISNULL(s1.total_logical_reads, 0)
+                INTO #qs_delta
+                FROM sys.dm_exec_query_stats AS qs
+                LEFT JOIN #qs_s1 AS s1
+                  ON  s1.plan_handle = qs.plan_handle
+                  AND s1.statement_start_offset = qs.statement_start_offset
+                  AND s1.statement_end_offset = qs.statement_end_offset
+                  AND s1.creation_time = qs.creation_time
+                WHERE qs.execution_count > ISNULL(s1.execution_count, 0)
+                /* Not in the first sample: count it only when it was compiled during the sample */
+                AND   (s1.plan_handle IS NOT NULL OR qs.creation_time >= @sample_start);
+
+                /* Keep plans compiled in this database */
+                SELECT
+                    p.plan_handle
+                INTO #qs_delta_db
+                FROM
+                (
+                    SELECT DISTINCT
+                        w.plan_handle
+                    FROM #qs_delta AS w
+                ) AS p
+                CROSS APPLY sys.dm_exec_plan_attributes(p.plan_handle) AS pa
+                WHERE pa.attribute = N'dbid'
+                AND   TRY_CONVERT(int, pa.value) = @db_id;
+
+                WITH
+                    agg AS
+                    (
+                        SELECT
+                            w.query_hash,
+                            executions = SUM(w.executions),
+                            cpu_us = SUM(w.cpu_us),
+                            elapsed_us = SUM(w.elapsed_us),
+                            logical_reads = SUM(w.logical_reads)
+                        FROM #qs_delta AS w
+                        JOIN #qs_delta_db AS pd
+                          ON pd.plan_handle = w.plan_handle
+                        GROUP BY
+                            w.query_hash
+                    ),
+                    ranked AS
+                    (
+                        SELECT
+                            agg.*,
+                            cpu_rank = ROW_NUMBER() OVER (ORDER BY agg.cpu_us DESC, agg.executions DESC),
+                            exec_rank = ROW_NUMBER() OVER (ORDER BY agg.executions DESC, agg.cpu_us DESC),
+                            all_cpu_us = SUM(agg.cpu_us) OVER (),
+                            all_reads = SUM(agg.logical_reads) OVER (),
+                            all_executions = SUM(agg.executions) OVER ()
+                        FROM agg
+                    )
+                SELECT
+                    rn = ROW_NUMBER() OVER (ORDER BY r.cpu_rank),
+                    ranked_by =
+                        ISNULL(STUFF(CONCAT(
+                            CASE WHEN r.cpu_rank <= @top_n THEN CONCAT(N', cpu #', r.cpu_rank) END,
+                            CASE WHEN r.exec_rank <= @top_n THEN CONCAT(N', executions #', r.exec_rank) END), 1, 2, N''), N''),
+                    query_hash = CONVERT(varchar(20), r.query_hash, 1),
+                    executions = r.executions,
+                    executions_per_sec = CONVERT(decimal(19, 1), r.executions / NULLIF(@sample_s, 0)),
+                    pct_of_executions = CONVERT(decimal(9, 1), 100.0 * r.executions / NULLIF(r.all_executions, 0)),
+                    cpu_ms = r.cpu_us / 1000,
+                    pct_of_cpu = CONVERT(decimal(9, 1), 100.0 * r.cpu_us / NULLIF(r.all_cpu_us, 0)),
+                    avg_cores = CONVERT(decimal(9, 2), r.cpu_us / 1000000.0 / NULLIF(@sample_s, 0)),
+                    avg_cpu_ms = CONVERT(decimal(19, 2), r.cpu_us / 1000.0 / NULLIF(r.executions, 0)),
+                    avg_duration_ms = CONVERT(decimal(19, 2), r.elapsed_us / 1000.0 / NULLIF(r.executions, 0)),
+                    logical_reads = r.logical_reads,
+                    pct_of_reads = CONVERT(decimal(9, 1), 100.0 * r.logical_reads / NULLIF(r.all_reads, 0)),
+                    avg_logical_reads = r.logical_reads / NULLIF(r.executions, 0),
+                    notes =
+                        ISNULL(STUFF(CONCAT(
+                            CASE WHEN r.executions >= 50 * @sample_s THEN N'; runs 50 times a second or more: many cheap executions add up' END,
+                            CASE WHEN r.cpu_us * 2 >= r.all_cpu_us AND r.all_cpu_us >= 1000000 THEN N'; half or more of the CPU of the statements that completed in the sample' END
+                        ), 1, 2, N''), N''),
+                    module_name = mo.module_name,
+                    plan_handle = CONVERT(varchar(130), rep.plan_handle, 1),
+                    statement_text =
+                        SUBSTRING
+                        (
+                            st.text,
+                            ISNULL(rep.statement_start_offset, 0) / 2 + 1,
+                            CASE
+                                WHEN ISNULL(rep.statement_end_offset, -1) = -1
+                                OR   rep.statement_end_offset < ISNULL(rep.statement_start_offset, 0)
+                                THEN 2147483647
+                                ELSE (rep.statement_end_offset - ISNULL(rep.statement_start_offset, 0)) / 2 + 1
+                            END
+                        )
+                INTO #o_plan_cache_sampled
+                FROM ranked AS r
+                OUTER APPLY
+                (
+                    SELECT TOP (1)
+                        w.plan_handle,
+                        w.sql_handle,
+                        w.statement_start_offset,
+                        w.statement_end_offset
+                    FROM #qs_delta AS w
+                    JOIN #qs_delta_db AS pd
+                      ON pd.plan_handle = w.plan_handle
+                    WHERE w.query_hash = r.query_hash
+                    ORDER BY
+                        w.cpu_us DESC
+                ) AS rep
+                OUTER APPLY sys.dm_exec_sql_text(rep.sql_handle) AS st
+                OUTER APPLY
+                (
+                    SELECT
+                        module_name = QUOTENAME(sc.name) + N'.' + QUOTENAME(o.name)
+                    FROM sys.objects AS o
+                    JOIN sys.schemas AS sc
+                      ON sc.schema_id = o.schema_id
+                    WHERE o.object_id = st.objectid
+                    AND   st.dbid = @db_id
+                ) AS mo
+                WHERE r.cpu_rank <= @top_n
+                OR    r.exec_rank <= @top_n;
+            END TRY
+            BEGIN CATCH
+                UPDATE #emit SET error_message = LEFT(ERROR_MESSAGE(), 4000) WHERE result_key = @rk;
+            END CATCH;
+
+            UPDATE #emit SET duration_ms = DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()) WHERE result_key = @rk;
+        END;
     END;
 
     /* ============================================================================================
@@ -5100,6 +5416,63 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         END CATCH;
 
         UPDATE #emit SET duration_ms = DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()) WHERE result_key = @rk;
+    END;
+
+    /* ============================================================================================
+       Forced plans and Query Store hints (also feed the summary). A forced plan or a hint that
+       cannot be applied fails silently: the query runs with another plan.
+       Dynamic SQL on purpose: plan_forcing_type_desc and sys.query_store_query_hints are newer
+       than the rest of Query Store, and a column that is not there must become a message.
+       ============================================================================================ */
+    IF @do_config = 1 OR @do_summary = 1
+    BEGIN
+        SET @t0 = SYSDATETIME();
+
+        SET @sql = N'
+INSERT #forcing (kind, query_id, plan_id, forcing_type, failure_count, last_failure_reason, last_execution)
+SELECT
+    N''forced plan'',
+    p.query_id,
+    p.plan_id,
+    p.plan_forcing_type_desc,
+    p.force_failure_count,
+    p.last_force_failure_reason_desc,
+    p.last_execution_time
+FROM sys.query_store_plan AS p
+WHERE p.is_forced_plan = 1;';
+
+        BEGIN TRY
+            IF @debug = 1 PRINT @sql;
+            EXEC sys.sp_executesql @sql;
+        END TRY
+        BEGIN CATCH
+            INSERT #messages (msg_type, section, message)
+            VALUES ('INFO', N'config', LEFT(N'Forced plans: ' + ERROR_MESSAGE(), 4000));
+        END CATCH;
+
+        SET @sql = N'
+INSERT #forcing (kind, query_id, forcing_type, failure_count, last_failure_reason, hint_text)
+SELECT
+    N''query hint'',
+    h.query_id,
+    h.source_desc,
+    h.query_hint_failure_count,
+    h.last_query_hint_failure_reason_desc,
+    h.query_hint_text
+FROM sys.query_store_query_hints AS h;';
+
+        BEGIN TRY
+            IF @debug = 1 PRINT @sql;
+            EXEC sys.sp_executesql @sql;
+        END TRY
+        BEGIN CATCH
+            INSERT #messages (msg_type, section, message)
+            VALUES ('INFO', N'config', LEFT(N'Query Store hints: ' + ERROR_MESSAGE(), 4000));
+        END CATCH;
+
+        IF @debug = 1
+            INSERT #messages (msg_type, section, message)
+            VALUES ('DEBUG', N'config', CONCAT(N'plan forcing collection: ', DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()), N' ms'));
     END;
 
     /* ============================================================================================
@@ -5461,6 +5834,68 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         END CATCH;
 
         UPDATE #emit SET duration_ms = DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()) WHERE result_key = @rk;
+
+        SELECT
+            @rk = N'plan_forcing',
+            @t0 = SYSDATETIME();
+
+        INSERT #emit (section_order, section_key, result_key, result_name, table_name, empty_message)
+        VALUES (1220, N'config', @rk, N'FORCED PLANS AND QUERY STORE HINTS (those that failed to apply first)', N'#o_plan_forcing', N'No forced plans and no Query Store hints in this database.');
+
+        BEGIN TRY
+            SELECT
+                rn = t.rn,
+                kind = t.kind,
+                status = CASE WHEN t.failure_count > 0 THEN CONCAT(N'FAILED ', t.failure_count, N' time(s)') ELSE N'OK' END,
+                query_id = t.query_id,
+                plan_id = t.plan_id,
+                forcing_type = t.forcing_type,
+                failure_count = t.failure_count,
+                last_failure_reason = NULLIF(t.last_failure_reason, N'NONE'),
+                last_execution = CONVERT(datetime, t.last_execution),
+                hint_text = t.hint_text,
+                notes =
+                    CASE
+                        WHEN t.failure_count > 0 AND t.kind = N'forced plan'
+                        THEN N'The query does not run with the forced plan. Unforce it, or force a plan that still can be built. Usual causes: an index that the plan needs was dropped or changed, or the schema changed.'
+                        WHEN t.failure_count > 0
+                        THEN N'The hint could not be applied. Clear it or correct it.'
+                        WHEN t.forcing_type = N'AUTO'
+                        THEN N'Forced by automatic tuning (FORCE_LAST_GOOD_PLAN).'
+                    END,
+                script =
+                    CASE t.kind
+                        WHEN N'forced plan' THEN CONCAT(N'EXEC sys.sp_query_store_unforce_plan @query_id = ', t.query_id, N', @plan_id = ', t.plan_id, N';')
+                        ELSE CONCAT(N'EXEC sys.sp_query_store_clear_hints @query_id = ', t.query_id, N';')
+                    END,
+                statement_text = qt.query_sql_text
+            INTO #o_plan_forcing
+            FROM
+            (
+                SELECT TOP (@top_n)
+                    f.kind,
+                    f.query_id,
+                    f.plan_id,
+                    f.forcing_type,
+                    f.failure_count,
+                    f.last_failure_reason,
+                    f.last_execution,
+                    f.hint_text,
+                    rn = ROW_NUMBER() OVER (ORDER BY CASE WHEN f.failure_count > 0 THEN 0 ELSE 1 END, f.failure_count DESC, f.last_execution DESC, f.query_id, f.plan_id)
+                FROM #forcing AS f
+                ORDER BY
+                    rn
+            ) AS t
+            LEFT JOIN sys.query_store_query AS q
+              ON q.query_id = t.query_id
+            LEFT JOIN sys.query_store_query_text AS qt
+              ON qt.query_text_id = q.query_text_id;
+        END TRY
+        BEGIN CATCH
+            UPDATE #emit SET error_message = LEFT(ERROR_MESSAGE(), 4000) WHERE result_key = @rk;
+        END CATCH;
+
+        UPDATE #emit SET duration_ms = DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()) WHERE result_key = @rk;
     END;
 
     /* ============================================================================================
@@ -5483,6 +5918,8 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
             cpu_us float NULL,
             duration_us float NULL,
             max_duration_us bigint NULL,
+            min_cpu_us bigint NULL,
+            max_cpu_us bigint NULL,
             logical_reads float NULL,
             physical_reads float NULL,
             page_server_reads float NULL,
@@ -5501,7 +5938,7 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         BEGIN TRY
             INSERT #qsp
             (
-                query_id, plan_id, executions, cpu_us, duration_us, max_duration_us, logical_reads, physical_reads,
+                query_id, plan_id, executions, cpu_us, duration_us, max_duration_us, min_cpu_us, max_cpu_us, logical_reads, physical_reads,
                 page_server_reads, writes, rows_returned, max_memory_pages, max_tempdb_pages, log_bytes, max_dop,
                 aborted, exceptions, last_execution
             )
@@ -5512,6 +5949,8 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                 SUM(rs.avg_cpu_time * rs.count_executions),
                 SUM(rs.avg_duration * rs.count_executions),
                 MAX(rs.max_duration),
+                MIN(rs.min_cpu_time),
+                MAX(rs.max_cpu_time),
                 SUM(rs.avg_logical_io_reads * rs.count_executions),
                 SUM(rs.avg_physical_io_reads * rs.count_executions),
                 SUM(rs.avg_page_server_io_reads * rs.count_executions),
@@ -5557,7 +5996,10 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                         last_execution = MAX(p.last_execution),
                         plans = COUNT(*),
                         best_plan_avg_cpu_us = MIN(CASE WHEN p.executions >= 5 THEN p.cpu_us / p.executions END),
-                        worst_plan_avg_cpu_us = MAX(CASE WHEN p.executions >= 5 THEN p.cpu_us / p.executions END)
+                        worst_plan_avg_cpu_us = MAX(CASE WHEN p.executions >= 5 THEN p.cpu_us / p.executions END),
+                        /* One plan whose CPU differs more than 10 times its average between executions, 100 ms or more at the top */
+                        vary_min_cpu_us = MIN(CASE WHEN p.executions >= 10 AND p.max_cpu_us >= 100000 AND (p.max_cpu_us - p.min_cpu_us) > 10 * (p.cpu_us / p.executions) THEN p.min_cpu_us END),
+                        vary_max_cpu_us = MAX(CASE WHEN p.executions >= 10 AND p.max_cpu_us >= 100000 AND (p.max_cpu_us - p.min_cpu_us) > 10 * (p.cpu_us / p.executions) THEN p.max_cpu_us END)
                     FROM #qsp AS p
                     GROUP BY
                         p.query_id
@@ -5614,6 +6056,10 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                             WHEN q.is_internal_query = 1 THEN N'; internal query'
                         END,
                         CASE WHEN r.worst_plan_avg_cpu_us >= 2 * r.best_plan_avg_cpu_us THEN N'; plans differ a lot in CPU (parameter sensitivity?)' END,
+                        CASE
+                            WHEN r.vary_max_cpu_us IS NOT NULL
+                            THEN CONCAT(N'; CPU of one plan ranges from ', CONVERT(decimal(19, 1), r.vary_min_cpu_us / 1000.0), N' ms to ', CONVERT(decimal(19, 1), r.vary_max_cpu_us / 1000.0), N' ms between executions (one plan for very different parameter values?)')
+                        END,
                         CASE WHEN fp.plan_id IS NOT NULL THEN CONCAT(N'; plan forced', N' (forcing failures: ' + NULLIF(CONCAT(fp.force_failure_count, N', ', fp.last_force_failure_reason_desc COLLATE DATABASE_DEFAULT), N'0, NONE') + N')') END,
                         CASE WHEN r.aborted > 0 THEN CONCAT(N'; ', r.aborted, N' aborted (timeout or cancel)') END,
                         CASE WHEN r.exceptions > 0 THEN CONCAT(N'; ', r.exceptions, N' failed with an error') END,
@@ -5809,12 +6255,207 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
     END;
 
     /* ============================================================================================
+       210 blocking_history (slow): blocked_process_report events from running database Extended
+       Events sessions with a ring_buffer target. Blocking that has ended is in no DMV, so this is
+       the only way to answer "what blocked us ten minutes ago". The service raises a report only
+       when a block lasts longer than its blocked process threshold, and repeats it while the
+       block lasts: the reports of one block are shown as one row.
+       ============================================================================================ */
+    DECLARE
+        @bh_sessions nvarchar(4000) = NULL,
+        @bh_count int = NULL,
+        @bh_worst nvarchar(600) = NULL;
+
+    IF @do_blocking = 1 AND @slow = 1
+    BEGIN
+        SELECT
+            @rk = N'blocking_history',
+            @t0 = SYSDATETIME();
+
+        INSERT #emit (section_order, section_key, result_key, result_name, table_name, empty_message)
+        VALUES (210, N'blocking', @rk, CONCAT(N'BLOCKING HISTORY (last ', @lookback_minutes, N' minutes, times in UTC; blocked process reports from database Extended Events sessions with a ring_buffer target)'), N'#o_blocking_history', N'No blocked process report captured in the window. See the messages for the Extended Events session that was read, or how to create one.');
+
+        CREATE TABLE #bh
+        (
+            bh_id int IDENTITY(1, 1) NOT NULL PRIMARY KEY,
+            session_name nvarchar(128) NOT NULL,
+            event_time_utc datetime2(3) NULL,
+            report xml NULL
+        );
+
+        BEGIN TRY
+            SELECT
+                @bh_sessions = LEFT(STRING_AGG(CONVERT(nvarchar(max), QUOTENAME(s.name)), N', '), 4000)
+            FROM sys.dm_xe_database_sessions AS s
+            WHERE EXISTS
+            (
+                SELECT
+                    1
+                FROM sys.dm_xe_database_session_events AS e
+                WHERE CONVERT(binary(8), e.event_session_address) = CONVERT(binary(8), s.address)
+                AND   e.event_name = N'blocked_process_report'
+            )
+            AND EXISTS
+            (
+                SELECT
+                    1
+                FROM sys.dm_xe_database_session_targets AS t
+                WHERE CONVERT(binary(8), t.event_session_address) = CONVERT(binary(8), s.address)
+                AND   t.target_name = N'ring_buffer'
+            );
+
+            IF @bh_sessions IS NULL
+            BEGIN
+                INSERT #messages (msg_type, section, message)
+                VALUES
+                (
+                    'INFO', N'blocking',
+                    N'No running database Extended Events session with a ring_buffer target captures blocked process reports, so blocking that has ended cannot be shown. To capture them (up to 4 MB of memory; keeps the most recent events): '
+                    + N'CREATE EVENT SESSION [blocking] ON DATABASE ADD EVENT sqlserver.blocked_process_report ADD TARGET package0.ring_buffer WITH (STARTUP_STATE = ON, MAX_MEMORY = 4 MB); '
+                    + N'ALTER EVENT SESSION [blocking] ON DATABASE STATE = START;'
+                );
+            END
+            ELSE
+            BEGIN
+                INSERT #bh (session_name, event_time_utc, report)
+                SELECT
+                    s.name,
+                    en.n.value('(@timestamp)[1]', 'datetime2(3)'),
+                    en.n.query('(data[@name="blocked_process"]/value/blocked-process-report)[1]')
+                FROM sys.dm_xe_database_sessions AS s
+                JOIN sys.dm_xe_database_session_targets AS t
+                  ON CONVERT(binary(8), t.event_session_address) = CONVERT(binary(8), s.address)
+                CROSS APPLY (SELECT target_xml = TRY_CONVERT(xml, t.target_data)) AS tx
+                CROSS APPLY tx.target_xml.nodes('/RingBufferTarget/event[@name="blocked_process_report"]') AS en (n)
+                WHERE t.target_name = N'ring_buffer';
+
+                DELETE #bh
+                WHERE event_time_utc IS NULL
+                OR    event_time_utc < DATEADD(MINUTE, -@lookback_minutes, CONVERT(datetime2(3), @now_utc));
+
+                /* One row per report */
+                SELECT
+                    b.bh_id,
+                    b.session_name,
+                    b.event_time_utc,
+                    blocked_spid = bd.n.value('@spid', 'int'),
+                    blocked_batch_started = bd.n.value('@lastbatchstarted', 'nvarchar(40)'),
+                    wait_ms = bd.n.value('@waittime', 'bigint'),
+                    lock_mode = bd.n.value('@lockMode', 'nvarchar(20)'),
+                    wait_resource = bd.n.value('@waitresource', 'nvarchar(512)'),
+                    blocked_isolation = bd.n.value('@isolationlevel', 'nvarchar(100)'),
+                    blocked_app = bd.n.value('@clientapp', 'nvarchar(256)'),
+                    blocked_host = bd.n.value('@hostname', 'nvarchar(256)'),
+                    blocked_login = bd.n.value('@loginname', 'nvarchar(256)'),
+                    blocked_input = bd.n.value('(inputbuf/text())[1]', 'nvarchar(max)'),
+                    blocking_spid = bg.n.value('@spid', 'int'),
+                    blocking_status = bg.n.value('@status', 'nvarchar(30)'),
+                    blocking_trancount = bg.n.value('@trancount', 'int'),
+                    blocking_isolation = bg.n.value('@isolationlevel', 'nvarchar(100)'),
+                    blocking_app = bg.n.value('@clientapp', 'nvarchar(256)'),
+                    blocking_host = bg.n.value('@hostname', 'nvarchar(256)'),
+                    blocking_login = bg.n.value('@loginname', 'nvarchar(256)'),
+                    blocking_input = bg.n.value('(inputbuf/text())[1]', 'nvarchar(max)')
+                INTO #bh_rows
+                FROM #bh AS b
+                OUTER APPLY b.report.nodes('/blocked-process-report/blocked-process/process') AS bd (n)
+                OUTER APPLY b.report.nodes('/blocked-process-report/blocking-process/process') AS bg (n);
+
+                /* The reports of one block (same waiter, blocker and batch of the waiter) as one row: the last and longest */
+                WITH
+                    e AS
+                    (
+                        SELECT
+                            r.*,
+                            rnk = ROW_NUMBER() OVER (PARTITION BY r.blocked_spid, r.blocking_spid, r.blocked_batch_started ORDER BY r.wait_ms DESC, r.bh_id DESC),
+                            reports = COUNT(*) OVER (PARTITION BY r.blocked_spid, r.blocking_spid, r.blocked_batch_started),
+                            first_report_utc = MIN(r.event_time_utc) OVER (PARTITION BY r.blocked_spid, r.blocking_spid, r.blocked_batch_started)
+                        FROM #bh_rows AS r
+                        WHERE r.blocked_spid IS NOT NULL
+                    )
+                SELECT TOP (@top_n)
+                    rn = ROW_NUMBER() OVER (ORDER BY e.event_time_utc DESC, e.bh_id DESC),
+                    last_report_utc = CONVERT(datetime2(0), e.event_time_utc),
+                    minutes_ago = DATEDIFF(MINUTE, e.event_time_utc, CONVERT(datetime2(3), @now_utc)),
+                    blocked_session_id = e.blocked_spid,
+                    blocking_session_id = e.blocking_spid,
+                    blocked_for_s = CONVERT(decimal(19, 1), e.wait_ms / 1000.0),
+                    reports = e.reports,
+                    first_report_utc = CONVERT(datetime2(0), e.first_report_utc),
+                    lock_mode = e.lock_mode,
+                    wait_resource = e.wait_resource,
+                    blocking_status = e.blocking_status,
+                    blocking_open_transactions = e.blocking_trancount,
+                    blocked_isolation_level = e.blocked_isolation,
+                    blocking_isolation_level = e.blocking_isolation,
+                    blocked_app = e.blocked_app,
+                    blocked_host = e.blocked_host,
+                    blocked_login = e.blocked_login,
+                    blocking_app = e.blocking_app,
+                    blocking_host = e.blocking_host,
+                    blocking_login = e.blocking_login,
+                    notes =
+                        ISNULL(STUFF(CONCAT(
+                            CASE WHEN e.blocking_status = N'sleeping' THEN N'; the blocker was idle with an open transaction: the application did not commit' END,
+                            CASE WHEN e.blocking_isolation LIKE N'%serializable%' OR e.blocking_isolation LIKE N'%repeatable%' THEN N'; the blocker ran at REPEATABLE READ or SERIALIZABLE' END,
+                            CASE WHEN e.lock_mode IN (N'S', N'IS') THEN N'; a reader was blocked by a writer' END,
+                            CASE WHEN e.wait_resource LIKE N'%COMPILE%' THEN N'; compile lock' END,
+                            CASE WHEN e.blocked_spid = e.blocking_spid THEN N'; a parallel query that waited on its own threads' END
+                        ), 1, 2, N''), N''),
+                    xe_session = e.session_name,
+                    blocked_input_buffer_text = LTRIM(RTRIM(e.blocked_input)),
+                    blocking_input_buffer_text = LTRIM(RTRIM(e.blocking_input))
+                INTO #o_blocking_history
+                FROM e
+                WHERE e.rnk = 1
+                ORDER BY
+                    e.event_time_utc DESC,
+                    e.bh_id DESC;
+
+                SELECT
+                    @bh_count = COUNT(*)
+                FROM #o_blocking_history;
+
+                SELECT TOP (1)
+                    @bh_worst =
+                        LEFT
+                        (
+                            CONCAT
+                            (
+                                N'longest: session ', h.blocked_session_id, N' was blocked by session ', h.blocking_session_id, N' for ', h.blocked_for_s, N' s, ',
+                                h.minutes_ago, N' min ago; blocker ', ISNULL(h.blocking_status, N'n/a'), N', ', ISNULL(h.blocking_login, N'n/a'), N' (' + h.blocking_app + N')'
+                            ),
+                            600
+                        )
+                FROM #o_blocking_history AS h
+                ORDER BY
+                    h.blocked_for_s DESC;
+
+                INSERT #messages (msg_type, section, message)
+                VALUES
+                (
+                    'INFO', N'blocking',
+                    LEFT(CONCAT(N'Blocked process reports read from ', @bh_sessions, N': ', @bh_count, N' block(s) in the last ', @lookback_minutes,
+                        N' minutes. A ring_buffer keeps only the most recent events (bounded by its MAX_MEMORY), so older reports may be gone.'), 4000)
+                );
+            END;
+        END TRY
+        BEGIN CATCH
+            UPDATE #emit SET error_message = LEFT(ERROR_MESSAGE(), 4000) WHERE result_key = @rk;
+        END CATCH;
+
+        UPDATE #emit SET duration_ms = DATEDIFF_BIG(MILLISECOND, @t0, SYSDATETIME()) WHERE result_key = @rk;
+    END;
+
+    /* ============================================================================================
        1300 deadlocks (slow): database_xml_deadlock_report events from running database Extended
        Events sessions with a ring_buffer target. A user database cannot read Azure's own deadlock
        telemetry, so without such a session the messages explain how to create one.
        ============================================================================================ */
     DECLARE
         @deadlock_count int = NULL,
+        @stats_recent int = NULL,
+        @stats_recent_list nvarchar(1600) = NULL,
         @dl_sessions nvarchar(4000) = NULL,
         @dl_total int = 0,
         @dl_latest datetime2(3) = NULL,
@@ -6169,10 +6810,8 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         VALUES (1400, N'stats', @rk, N'STALE STATISTICS (past the auto-update threshold first, then by modifications; at most 3 per table)', N'#o_stale_statistics', N'No statistics have modifications since their last update.');
 
         BEGIN TRY
-            WITH
-                st AS
-                (
-                    SELECT
+            /* Staged once: the stale list and the list of recent updates both read it */
+            SELECT
                         s.object_id,
                         s.stats_id,
                         schema_name = sc.name,
@@ -6194,6 +6833,7 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                                 WHEN ISNULL(@compat_level, 130) >= 130 AND SQRT(1000.0 * sp.rows) < 500 + 0.20 * sp.rows THEN SQRT(1000.0 * sp.rows)
                                 ELSE 500 + 0.20 * sp.rows
                             END
+                    INTO #st
                     FROM sys.stats AS s
                     JOIN sys.objects AS o
                       ON o.object_id = s.object_id
@@ -6202,7 +6842,19 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                     CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
                     WHERE o.is_ms_shipped = 0
                     AND   o.type IN ('U', 'V')
-                    AND   sp.modification_counter > 0
+                    AND
+                    (
+                        sp.modification_counter > 0
+                        OR sp.last_updated >= DATEADD(MINUTE, -15, @now)
+                    );
+
+            WITH
+                st AS
+                (
+                    SELECT
+                        x.*
+                    FROM #st AS x
+                    WHERE x.modification_counter > 0
                 ),
                 ranked AS
                 (
@@ -6283,6 +6935,33 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
                 FROM sys.databases AS d
                 WHERE d.database_id = @db_id
             ) AS db;
+
+            SELECT
+                @stats_recent = COUNT(*),
+                @stats_recent_list =
+                    LEFT
+                    (
+                        STRING_AGG
+                        (
+                            CASE
+                                WHEN x.rnk <= 5
+                                THEN CONVERT(nvarchar(max), CONCAT(QUOTENAME(x.schema_name), N'.', QUOTENAME(x.table_name), N' (', x.stats_name, N') at ', CONVERT(nvarchar(8), x.last_updated, 108)))
+                            END,
+                            N'; '
+                        ) WITHIN GROUP (ORDER BY x.rnk),
+                        1600
+                    )
+            FROM
+            (
+                SELECT
+                    s.schema_name,
+                    s.table_name,
+                    s.stats_name,
+                    s.last_updated,
+                    rnk = ROW_NUMBER() OVER (ORDER BY s.last_updated DESC)
+                FROM #st AS s
+                WHERE s.last_updated >= DATEADD(MINUTE, -15, @now)
+            ) AS x;
         END TRY
         BEGIN CATCH
             UPDATE #emit SET error_message = LEFT(ERROR_MESSAGE(), 4000) WHERE result_key = @rk;
@@ -6916,6 +7595,9 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         @f_qs_cleanup_auto bit,
         @f_at_mismatch nvarchar(2000),
         @f_regressions int,
+        @f_force_total int,
+        @f_force_failed int,
+        @f_force_example nvarchar(400),
         @f_pvs_mb decimal(19, 1),
         @f_pvs_aborted bigint,
         @f_pvs_oldest_xact bigint,
@@ -7000,6 +7682,20 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         @f_ha_desc nvarchar(2000),
         @f_batches bigint,
         @f_compiles bigint,
+        @f_recompiles bigint,
+        @f_attentions bigint,
+        @f_io_read_count bigint,
+        @f_io_read_stall_ms bigint,
+        @f_rollback int,
+        @f_rollback_blocking int,
+        @f_rollback_desc nvarchar(600),
+        @f_identity_count int,
+        @f_identity_max_pct decimal(9, 1),
+        @f_identity_list nvarchar(1600),
+        @f_wait_compile_ms bigint,
+        @f_wait_ioretry_ms bigint,
+        @f_compile_now int,
+        @f_idle_implicit int,
         @f_deadlocks_delta bigint,
         @f_counter_s decimal(18, 3),
         @f_n_crit int,
@@ -7415,6 +8111,7 @@ AND   mh.severity_level >= 3;';
                 @f_idle_tran = COUNT(*),
                 @f_idle_tran_max_s = MAX(DATEDIFF_BIG(SECOND, ISNULL(s.last_request_end_time, s.login_time), @now)),
                 @f_idle_work = ISNULL(SUM(h.holds), 0),
+                @f_idle_implicit = ISNULL(SUM(h.implicit), 0),
                 @f_idle_work_max_s = MAX(CASE WHEN h.holds = 1 THEN DATEDIFF_BIG(SECOND, ISNULL(s.last_request_end_time, s.login_time), @now) END)
             FROM #sess AS s
             CROSS APPLY
@@ -7424,6 +8121,11 @@ AND   mh.severity_level >= 3;';
                         CASE
                             WHEN EXISTS (SELECT 1/0 FROM #trn AS th WHERE th.session_id = s.session_id AND th.holds_resources = 1) THEN 1
                             WHEN EXISTS (SELECT 1/0 FROM #blk_counts AS ch WHERE ch.session_id = s.session_id AND ch.total_blocked > 0) THEN 1
+                            ELSE 0
+                        END,
+                    implicit =
+                        CASE
+                            WHEN EXISTS (SELECT 1/0 FROM #trn AS ti WHERE ti.session_id = s.session_id AND ti.transaction_name = N'implicit_transaction') THEN 1
                             ELSE 0
                         END
             ) AS h
@@ -7461,6 +8163,11 @@ AND   mh.severity_level >= 3;';
                         CASE
                             WHEN EXISTS (SELECT 1/0 FROM #trn AS th WHERE th.session_id = s.session_id AND th.holds_resources = 1) THEN 1
                             WHEN EXISTS (SELECT 1/0 FROM #blk_counts AS ch WHERE ch.session_id = s.session_id AND ch.total_blocked > 0) THEN 1
+                            ELSE 0
+                        END,
+                    implicit =
+                        CASE
+                            WHEN EXISTS (SELECT 1/0 FROM #trn AS ti WHERE ti.session_id = s.session_id AND ti.transaction_name = N'implicit_transaction') THEN 1
                             ELSE 0
                         END
             ) AS h
@@ -7504,6 +8211,12 @@ AND   mh.severity_level >= 3;';
                 @f_threadpool_tasks = COUNT(*)
             FROM #wt AS w
             WHERE w.wait_type = N'THREADPOOL'
+            AND   w.task_rank = 1;
+
+            SELECT
+                @f_compile_now = COUNT(*)
+            FROM #wt AS w
+            WHERE w.wait_type = N'RESOURCE_SEMAPHORE_QUERY_COMPILE'
             AND   w.task_rank = 1;
 
             /* The largest grant that has been held for a minute or more and is mostly unused, and
@@ -7662,7 +8375,9 @@ AND   mh.severity_level >= 3;';
                 SELECT
                     @f_wait_total_ms = SUM(d.wait_ms),
                     @f_wait_gov_ms = SUM(CASE WHEN d.is_gov = 1 THEN d.wait_ms ELSE 0 END),
-                    @f_wait_threadpool_ms = SUM(CASE WHEN d.wait_type = N'THREADPOOL' THEN d.wait_ms ELSE 0 END)
+                    @f_wait_threadpool_ms = SUM(CASE WHEN d.wait_type = N'THREADPOOL' THEN d.wait_ms ELSE 0 END),
+                    @f_wait_compile_ms = SUM(CASE WHEN d.wait_type = N'RESOURCE_SEMAPHORE_QUERY_COMPILE' THEN d.wait_ms ELSE 0 END),
+                    @f_wait_ioretry_ms = SUM(CASE WHEN d.wait_type = N'IO_RETRY' THEN d.wait_ms ELSE 0 END)
                 FROM @f_wd AS d;
 
                 SELECT
@@ -7697,11 +8412,16 @@ AND   mh.severity_level >= 3;';
                 @f_io_data_stall_ms = SUM(CASE WHEN d.is_log = 0 THEN d.stall_ms ELSE 0 END),
                 @f_io_data_queued_ms = SUM(CASE WHEN d.is_log = 0 THEN d.queued_ms ELSE 0 END),
                 @f_io_log_writes = SUM(CASE WHEN d.is_log = 1 THEN d.writes ELSE 0 END),
-                @f_io_log_stall_ms = SUM(CASE WHEN d.is_log = 1 THEN d.write_stall_ms ELSE 0 END)
+                @f_io_log_stall_ms = SUM(CASE WHEN d.is_log = 1 THEN d.write_stall_ms ELSE 0 END),
+                @f_io_read_count = SUM(CASE WHEN d.is_log = 0 AND d.is_cache = 0 THEN d.reads ELSE 0 END),
+                @f_io_read_stall_ms = SUM(CASE WHEN d.is_log = 0 AND d.is_cache = 0 THEN d.read_stall_ms ELSE 0 END)
             FROM
             (
                 SELECT
                     is_log = CASE WHEN df.type = 1 THEN 1 ELSE 0 END,
+                    is_cache = CASE WHEN s2.database_id = 0 THEN 1 ELSE 0 END,
+                    reads = s2.num_of_reads - ISNULL(s1.num_of_reads, 0),
+                    read_stall_ms = s2.io_stall_read_ms - ISNULL(s1.io_stall_read_ms, 0),
                     ios =
                         (s2.num_of_reads - ISNULL(s1.num_of_reads, 0))
                         + CASE WHEN @is_hyperscale = 1 AND s2.database_id = @db_id AND df.type = 0 THEN 0 ELSE s2.num_of_writes - ISNULL(s1.num_of_writes, 0) END,
@@ -7789,6 +8509,8 @@ AND   mh.severity_level >= 3;';
             SELECT
                 @f_batches = SUM(CASE WHEN d.counter_name = N'Batch Requests/sec' THEN d.delta END),
                 @f_compiles = SUM(CASE WHEN d.counter_name = N'SQL Compilations/sec' THEN d.delta END),
+                @f_recompiles = SUM(CASE WHEN d.counter_name = N'SQL Re-Compilations/sec' THEN d.delta END),
+                @f_attentions = SUM(CASE WHEN d.counter_name = N'SQL Attention rate' AND @is_sampled = 1 THEN d.delta END),
                 @f_deadlocks_delta = SUM(CASE WHEN d.counter_name = N'Number of Deadlocks/sec' AND @is_sampled = 1 THEN d.delta END)
             FROM
             (
@@ -7803,7 +8525,7 @@ AND   mh.severity_level >= 3;';
                   AND ISNULL(p1.instance_name, N'') = ISNULL(p2.instance_name, N'')
                 WHERE p2.sample_no = 2
                 AND   p2.cntr_type = 272696576
-                AND   p2.counter_name IN (N'Batch Requests/sec', N'SQL Compilations/sec', N'Number of Deadlocks/sec')
+                AND   p2.counter_name IN (N'Batch Requests/sec', N'SQL Compilations/sec', N'SQL Re-Compilations/sec', N'SQL Attention rate', N'Number of Deadlocks/sec')
                 AND   (p2.counter_name <> N'Number of Deadlocks/sec' OR p2.instance_name = N'_Total')
             ) AS d;
 
@@ -7838,19 +8560,155 @@ AND   mh.severity_level >= 3;';
             VALUES ('INFO', N'summary', LEFT(N'Replica, counter and tempdb facts: ' + ERROR_MESSAGE(), 4000));
         END CATCH;
 
+        /* Forced plans and Query Store hints that failed to apply */
+        SELECT
+            @f_force_total = COUNT(*),
+            @f_force_failed = ISNULL(SUM(CASE WHEN f.failure_count > 0 THEN 1 ELSE 0 END), 0)
+        FROM #forcing AS f;
+
+        SELECT TOP (1)
+            @f_force_example =
+                LEFT
+                (
+                    CONCAT
+                    (
+                        f.kind, N' for query_id ', f.query_id, N', plan_id ' + CONVERT(nvarchar(20), f.plan_id), N': ', f.failure_count,
+                        N' failure(s), last reason ', ISNULL(NULLIF(f.last_failure_reason, N''), N'n/a')
+                    ),
+                    400
+                )
+        FROM #forcing AS f
+        WHERE f.failure_count > 0
+        ORDER BY
+            f.failure_count DESC,
+            f.query_id;
+
+        /* Requests that are rolling back (5 seconds or more, so a normal ROLLBACK statement does not count) */
+        BEGIN TRY
+            SELECT
+                @f_rollback = COUNT(*),
+                @f_rollback_blocking = ISNULL(SUM(CASE WHEN c.total_blocked > 0 THEN 1 ELSE 0 END), 0)
+            FROM #req AS r
+            LEFT JOIN #blk_counts AS c
+              ON c.session_id = r.session_id
+            WHERE r.database_id = @db_id
+            AND   r.total_elapsed_time >= 5000
+            AND
+            (
+                r.status = N'rollback'
+                OR r.command LIKE N'%ROLLBACK%'
+                OR EXISTS (SELECT 1/0 FROM #trn AS t WHERE t.session_id = r.session_id AND t.transaction_state = 7)
+            );
+
+            SELECT TOP (1)
+                @f_rollback_desc =
+                    LEFT
+                    (
+                        CONCAT
+                        (
+                            N'session ', r.session_id, N' (', r.command, N', ', r.status, N'), running ', r.total_elapsed_time / 1000, N' s',
+                            N', ' + CONVERT(nvarchar(20), CONVERT(decimal(9, 1), NULLIF(r.percent_complete, 0))) + N'% complete',
+                            CASE WHEN c.total_blocked > 0 THEN CONCAT(N', blocking ', c.total_blocked, N' session(s)') END,
+                            N'; ', s.login_name, N' (' + s.program_name + N')'
+                        ),
+                        600
+                    )
+            FROM #req AS r
+            LEFT JOIN #blk_counts AS c
+              ON c.session_id = r.session_id
+            LEFT JOIN #sess AS s
+              ON s.session_id = r.session_id
+            WHERE r.database_id = @db_id
+            AND   r.total_elapsed_time >= 5000
+            AND
+            (
+                r.status = N'rollback'
+                OR r.command LIKE N'%ROLLBACK%'
+                OR EXISTS (SELECT 1/0 FROM #trn AS t WHERE t.session_id = r.session_id AND t.transaction_state = 7)
+            )
+            ORDER BY
+                ISNULL(c.total_blocked, 0) DESC,
+                r.total_elapsed_time DESC;
+        END TRY
+        BEGIN CATCH
+            INSERT #messages (msg_type, section, message)
+            VALUES ('INFO', N'summary', LEFT(N'Rollback facts: ' + ERROR_MESSAGE(), 4000));
+        END CATCH;
+
+        /* Identity columns that count up and have used 90% or more of the range of their data type */
+        BEGIN TRY
+            SELECT
+                @f_identity_count = COUNT(*),
+                @f_identity_max_pct = MAX(x.pct_used),
+                @f_identity_list =
+                    LEFT
+                    (
+                        STRING_AGG
+                        (
+                            CASE
+                                WHEN x.rnk <= 5
+                                THEN CONVERT(nvarchar(max), CONCAT(x.column_ref, N' ', CONVERT(decimal(9, 1), x.pct_used), N'% of ', x.type_name))
+                            END,
+                            N'; '
+                        ) WITHIN GROUP (ORDER BY x.rnk),
+                        1600
+                    )
+            FROM
+            (
+                SELECT
+                    column_ref = QUOTENAME(sc.name) + N'.' + QUOTENAME(o.name) + N'.' + QUOTENAME(ic.name),
+                    type_name = m.type_name,
+                    pct_used = 100.0 * TRY_CONVERT(float, ic.last_value) / m.max_value,
+                    rnk = ROW_NUMBER() OVER (ORDER BY TRY_CONVERT(float, ic.last_value) / m.max_value DESC, ic.object_id)
+                FROM sys.identity_columns AS ic
+                JOIN sys.objects AS o
+                  ON o.object_id = ic.object_id
+                JOIN sys.schemas AS sc
+                  ON sc.schema_id = o.schema_id
+                CROSS APPLY
+                (
+                    SELECT
+                        max_value =
+                            CASE ic.system_type_id
+                                WHEN 48 THEN CONVERT(float, 255)
+                                WHEN 52 THEN CONVERT(float, 32767)
+                                WHEN 56 THEN CONVERT(float, 2147483647)
+                                WHEN 127 THEN CONVERT(float, 9223372036854775807)
+                            END,
+                        type_name =
+                            CASE ic.system_type_id
+                                WHEN 48 THEN N'tinyint'
+                                WHEN 52 THEN N'smallint'
+                                WHEN 56 THEN N'int'
+                                WHEN 127 THEN N'bigint'
+                            END
+                ) AS m
+                WHERE o.is_ms_shipped = 0
+                AND   o.type = 'U'
+                AND   ic.system_type_id IN (48, 52, 56, 127)
+                AND   TRY_CONVERT(float, ic.increment_value) > 0
+                AND   TRY_CONVERT(float, ic.last_value) >= 0.90 * m.max_value
+            ) AS x;
+        END TRY
+        BEGIN CATCH
+            INSERT #messages (msg_type, section, message)
+            VALUES ('INFO', N'summary', LEFT(N'Identity column facts: ' + ERROR_MESSAGE(), 4000));
+        END CATCH;
+
         /* ----------------------------------------------------------------------------------------
            Findings. Severity: 1 critical, 2 high, 3 medium, 4 low, 5 info. Each group is
            isolated so a problem in one rule cannot suppress the others.
            ---------------------------------------------------------------------------------------- */
         BEGIN TRY
-            INSERT #findings (severity_rank, area, finding, evidence, recommended_action, see_section)
+            INSERT #findings (severity_rank, area, finding, evidence, recommended_action, see_section, code)
             SELECT
                 v.sev,
                 v.area,
                 LEFT(v.finding, 400),
                 LEFT(v.evidence, 2000),
                 LEFT(v.action, 2000),
-                v.see
+                v.see,
+                v.code
             FROM
             (
                 VALUES
@@ -7873,7 +8731,8 @@ AND   mh.severity_level >= 3;';
                         N'; runnable tasks per scheduler ', ISNULL(CONVERT(nvarchar(20), @f_runnable_avg), N'n/a')
                     ),
                     N'Find the top CPU consumers in requests (cpu_time, or the CPU delta with @sample_seconds) and in plan_cache_top / query_store_top. Look for plan regressions, missing indexes and excessive parallelism; scale up if the load is legitimate.',
-                    N'resource_stats, requests, plan_cache_top, query_store_top'
+                    N'resource_stats, requests, plan_cache_top, query_store_top',
+                    N'CPU_LIMIT'
                 ),
                 (
                     CASE WHEN @f_icpu_avg5 >= 90 AND ISNULL(@f_cpu_avg5, 0) < 75 THEN 2 END,
@@ -7881,7 +8740,8 @@ AND   mh.severity_level >= 3;';
                     N'SQL instance CPU is high although the user workload CPU is not',
                     CONCAT(N'avg_instance_cpu_percent 5-min avg ', @f_icpu_avg5, N'%, latest ', @f_icpu_now, N'%; avg_cpu_percent 5-min avg ', @f_cpu_avg5, N'%'),
                     N'CPU is used outside this database''s user workload: other databases in the elastic pool, or background work such as ADR version cleanup, ghost cleanup, automatic statistics updates or Query Store. Check the pool and the system requests.',
-                    N'resource_stats, requests'
+                    N'resource_stats, requests',
+                    N'INSTANCE_CPU_HIGH'
                 ),
                 (
                     CASE WHEN @f_workers_pct >= 95 THEN 1 WHEN @f_workers_pct >= 80 THEN 2 END,
@@ -7898,7 +8758,8 @@ AND   mh.severity_level >= 3;';
                         N'); blocked sessions ', ISNULL(@f_blocked, 0)
                     ),
                     N'Workers pile up behind blocking and parallel queries. Resolve blocking first (blocking_tree), reduce the DOP of heavy parallel queries, and look for connection or retry storms in sessions_by_app. A larger service objective raises the worker limit.',
-                    N'blocking_tree, requests, workload_group, sessions_by_app'
+                    N'blocking_tree, requests, workload_group, sessions_by_app',
+                    N'WORKERS_LIMIT'
                 ),
                 (
                     CASE
@@ -7916,7 +8777,8 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @is_sampled = 1 THEN CONCAT(N'; THREADPOOL wait during the sample ', ISNULL(@f_wait_threadpool_ms, 0), N' ms') END
                     ),
                     N'Worker starvation: new requests and logins stall or time out. It is usually caused by a large blocking chain or many parallel requests holding workers; find it in blocking_tree and requests before scaling up.',
-                    N'blocking_tree, requests, workload_group, schedulers'
+                    N'blocking_tree, requests, workload_group, schedulers',
+                    N'THREADPOOL_WAITS'
                 ),
                 (
                     CASE WHEN @f_sessions_now >= 80 OR @f_sessions_max5 >= 80 THEN 2 END,
@@ -7929,7 +8791,8 @@ AND   mh.severity_level >= 3;';
                         ISNULL(@f_sess_sleeping, 0), N' sleeping); limit ', ISNULL(CONVERT(nvarchar(20), @rg_max_sessions), N'n/a')
                     ),
                     N'Check sessions_by_app for a connection leak or oversized connection pools. At the limit new logins fail with error 10928.',
-                    N'sessions_by_app, governance'
+                    N'sessions_by_app, governance',
+                    N'SESSIONS_LIMIT'
                 ),
                 (
                     CASE WHEN @f_log_now >= 90 OR @f_log_avg5 >= 80 THEN 2 END,
@@ -7942,7 +8805,8 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @f_gov_now > 0 THEN CONCAT(N'; governance waits now: ', @f_gov_now_types) END
                     ),
                     N'Large modifications, index rebuilds, bulk loads or bursts of small commits use up the log rate and commits slow down (LOG_RATE_GOVERNOR). Find the writers in requests (writes) and open_transactions (log used); batch or reschedule them, or scale up.',
-                    N'resource_stats, requests, open_transactions, wait_stats'
+                    N'resource_stats, requests, open_transactions, wait_stats',
+                    N'LOG_RATE_LIMIT'
                 ),
                 (
                     CASE WHEN @f_io_now >= 90 OR @f_io_avg5 >= 80 THEN 2 END,
@@ -7955,7 +8819,8 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @is_hyperscale = 1 THEN N' (Hyperscale: the percentage covers the local SSD cache and tempdb)' END
                     ),
                     N'Large scans, spills and memory pressure drive data IO. Check requests and plan_cache_top by reads, missing indexes and tempdb spills; scale up if the load is legitimate.',
-                    N'resource_stats, requests, plan_cache_top, file_io'
+                    N'resource_stats, requests, plan_cache_top, file_io',
+                    N'DATA_IO_LIMIT'
                 ),
                 (
                     CASE
@@ -7976,7 +8841,8 @@ AND   mh.severity_level >= 3;';
                         END
                     ),
                     N'LOG_RATE_GOVERNOR, POOL_LOG_RATE_GOVERNOR, HADR_THROTTLE_LOG_RATE_* and RBIO_RG_* mean log generation is throttled (on Hyperscale RBIO_RG_* can also mean a page server or replica is behind): batch writes, avoid huge transactions, reschedule index maintenance. IO_QUEUE_LIMIT means the data IOPS limit: reduce scans and spills. RESMGR_THROTTLED means the request limit. Scale up if the load is legitimate.',
-                    N'waits_now, wait_stats, resource_stats, file_io'
+                    N'waits_now, wait_stats, resource_stats, file_io',
+                    N'GOVERNANCE_THROTTLING'
                 ),
                 (
                     CASE WHEN @f_grants_pending > 0 THEN 2 END,
@@ -7989,7 +8855,8 @@ AND   mh.severity_level >= 3;';
                         N' MB; memory usage ', ISNULL(CONVERT(nvarchar(20), @f_mem_now), N'n/a'), N'%'
                     ),
                     N'Compare requested and used memory in memory_grants: oversized grants come from bad estimates and large sorts or hashes. Fix the query or index, or cap the grant with a MAX_GRANT_PERCENT hint (a Query Store hint works without code changes).',
-                    N'memory_grants, resource_semaphores, requests'
+                    N'memory_grants, resource_semaphores, requests',
+                    N'MEMORY_GRANTS_PENDING'
                 ),
                 (
                     CASE
@@ -8011,7 +8878,8 @@ AND   mh.severity_level >= 3;';
                         + N'% of the ' + CONVERT(nvarchar(30), @f_grant_target_mb) + N' MB that the user pool can grant'
                     ),
                     N'The grant stays reserved until the query ends, and other queries that need a large grant can then wait (RESOURCE_SEMAPHORE). The estimate is too high: stale statistics, a row estimate far above the real row count, or wide columns in a sort or hash. Update the statistics, return and sort fewer and narrower columns, or cap the grant with a MAX_GRANT_PERCENT hint (a Query Store hint needs no code change). Memory grant feedback, when it is enabled, lowers the grant for later executions of the same plan.',
-                    N'memory_grants, requests, query_store_top'
+                    N'memory_grants, requests, query_store_top',
+                    N'MEMORY_GRANT_UNUSED'
                 ),
                 (
                     /* Snapshots arrive about every 15 seconds; one or two HIGH snapshots are a brief blip */
@@ -8028,9 +8896,46 @@ AND   mh.severity_level >= 3;';
                         ISNULL(@f_mh_high, 0), CASE WHEN @f_mh_clerks IS NOT NULL THEN CONCAT(N'; top clerks: ', @f_mh_clerks) END
                     ),
                     N'Out-of-memory errors (701) become likely. Check memory_clerks for a clerk that keeps growing and memory_grants for very large grants.',
-                    N'memory_health, memory_clerks, memory_grants'
+                    N'memory_health, memory_clerks, memory_grants',
+                    N'MEMORY_HEALTH'
+                ),
+                (
+                    CASE WHEN @f_compile_now > 0 OR @f_wait_compile_ms >= 1000 THEN 3 END,
+                    N'Compilations',
+                    N'Queries are waiting for compile memory (RESOURCE_SEMAPHORE_QUERY_COMPILE)',
+                    CONCAT
+                    (
+                        N'tasks waiting now ', ISNULL(@f_compile_now, 0),
+                        CASE WHEN @is_sampled = 1 THEN CONCAT(N'; ', ISNULL(@f_wait_compile_ms, 0), N' ms of this wait during the ', @sample_s, N' s sample') END
+                    ),
+                    N'Many large compilations run at the same time and wait for a compile gateway. Find the statements that compile often or are very large (notes in plan_cache_top, compilations in perf_counters), parameterize ad hoc SQL and remove needless recompiles.',
+                    N'waits_now, session_waits_sampled, perf_counters',
+                    N'COMPILE_MEMORY_WAITS'
+                ),
+                (
+                    CASE WHEN @f_wait_ioretry_ms >= 1000 THEN 3 END,
+                    N'Data IO',
+                    N'Storage IO is being retried (IO_RETRY)',
+                    CONCAT(ISNULL(@f_wait_ioretry_ms, 0), N' ms of IO_RETRY wait during the ', @sample_s, N' s sample'),
+                    N'IO requests failed and were retried, which points at a storage problem on the platform side. If it continues, check Azure Resource Health and open a support case.',
+                    N'session_waits_sampled, wait_stats, file_io',
+                    N'IO_RETRY'
+                ),
+                (
+                    /* A few attentions are normal: some drivers send one when they close a reader early */
+                    CASE WHEN @is_sampled = 1 AND @f_attentions >= @sample_s AND @f_attentions >= 0.05 * @f_batches THEN 3 END,
+                    N'Requests',
+                    CONCAT(@f_attentions, N' request(s) were cancelled by the client during the sample'),
+                    CONCAT
+                    (
+                        CONVERT(decimal(19, 1), @f_attentions / NULLIF(@sample_s, 0)), N' attentions/s vs ',
+                        CONVERT(decimal(19, 1), @f_batches / NULLIF(@sample_s, 0)), N' batch requests/s over ', @sample_s, N' s'
+                    ),
+                    N'A client sends an attention when it cancels a request, most often because its command timeout expired. Find what runs longer than the application timeout in requests, and what blocks it in blocking_tree.',
+                    N'perf_counters, requests, blocking_tree',
+                    N'CLIENT_CANCELLATIONS'
                 )
-            ) AS v (sev, area, finding, evidence, action, see)
+            ) AS v (sev, area, finding, evidence, action, see, code)
             WHERE v.sev IS NOT NULL;
         END TRY
         BEGIN CATCH
@@ -8039,14 +8944,15 @@ AND   mh.severity_level >= 3;';
         END CATCH;
 
         BEGIN TRY
-            INSERT #findings (severity_rank, area, finding, evidence, recommended_action, see_section)
+            INSERT #findings (severity_rank, area, finding, evidence, recommended_action, see_section, code)
             SELECT
                 v.sev,
                 v.area,
                 LEFT(v.finding, 400),
                 LEFT(v.evidence, 2000),
                 LEFT(v.action, 2000),
-                v.see
+                v.see,
+                v.code
             FROM
             (
                 VALUES
@@ -8076,7 +8982,8 @@ AND   mh.severity_level >= 3;';
                         THEN N'An idle session holds locks inside an open transaction: the application did not commit or roll back (missing COMMIT, an error path without ROLLBACK, or user interaction inside a transaction). Check its input buffer in blocking_tree; KILL it only after confirming the rollback is acceptable.'
                         ELSE N'Review the head blocker statement and the locks it holds in blocking_tree. Batch long modifications, keep transactions short, and check for missing indexes that turn seeks into scans that lock more rows.'
                     END,
-                    N'blocking_tree, requests, open_transactions'
+                    N'blocking_tree, requests, open_transactions',
+                    N'BLOCKING'
                 ),
                 (
                     CASE WHEN @f_blk_cycle > 0 THEN 3 END,
@@ -8084,7 +8991,8 @@ AND   mh.severity_level >= 3;';
                     N'Sessions are blocked in or behind a cycle with no head blocker',
                     CONCAT(@f_blk_cycle, N' session(s) are in or behind a blocking cycle (listed at the end of blocking_tree)'),
                     N'A lock deadlock is resolved by the deadlock monitor within seconds; a cycle that persists usually involves parallel query threads or a resource SQL Server cannot see. Re-run to confirm and check deadlocks.',
-                    N'blocking_tree, deadlocks'
+                    N'blocking_tree, deadlocks',
+                    N'BLOCKING_CYCLE'
                 ),
                 (
                     CASE WHEN @f_req_long > 0 THEN CASE WHEN @f_long_s >= 1800 THEN 3 ELSE 4 END END,
@@ -8092,7 +9000,8 @@ AND   mh.severity_level >= 3;';
                     CONCAT(@f_req_long, N' request(s) running longer than ', @long_running_seconds, N' s'),
                     CONCAT(N'longest ', @f_long_s, N' s: ', @f_long_desc),
                     N'Check the statement, plan and current wait in requests. Long requests are normal for maintenance and reporting; otherwise look for plan regressions (query_store_top, tuning_recommendations), blocking or a missing index.',
-                    N'requests, blocking_tree, query_store_top'
+                    N'requests, blocking_tree, query_store_top',
+                    N'LONG_REQUESTS'
                 ),
                 (
                     CASE WHEN @f_tran_oldest_s >= 3600 THEN 2 WHEN @f_tran_oldest_s >= 600 THEN 3 END,
@@ -8105,7 +9014,8 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @f_pvs_oldest_session = @f_tran_oldest_session THEN N'; it is the oldest transaction holding back version store cleanup' END
                     ),
                     N'Long transactions hold locks and prevent log truncation and version store cleanup. See what the session is doing in open_transactions; commit or roll back, or KILL it only after weighing the rollback time.',
-                    N'open_transactions, version_store, log_usage'
+                    N'open_transactions, version_store, log_usage',
+                    N'LONG_TRANSACTION'
                 ),
                 (
                     CASE
@@ -8123,6 +9033,7 @@ AND   mh.severity_level >= 3;';
                     (
                         @f_idle_tran, N' idle session(s) have an open transaction; ', ISNULL(@f_idle_work, 0),
                         N' of them wrote log, read under SNAPSHOT, keep shared locks or block others; ',
+                        CASE WHEN @f_idle_implicit > 0 THEN CONCAT(@f_idle_implicit, N' of them are implicit transactions (SET IMPLICIT_TRANSACTIONS ON); ') END,
                         N'session ', @f_idle_tran_session, N' idle ', @f_idle_tran_session_s, N' s',
                         CASE WHEN @f_idle_tran_age_s IS NOT NULL THEN CONCAT(N', transaction open ', @f_idle_tran_age_s, N' s') END,
                         CASE WHEN @f_idle_tran_blocking > 0 THEN CONCAT(N', blocking ', @f_idle_tran_blocking, N' session(s)') END,
@@ -8133,7 +9044,8 @@ AND   mh.severity_level >= 3;';
                         THEN N'The application opened a transaction and stopped sending work without committing. Check the input buffer in open_transactions and fix the code path (missing COMMIT, error handling without ROLLBACK, implicit transactions left on).'
                         ELSE N'These transactions wrote nothing and hold no locks, log or row versions, so they block nobody now. The usual cause is a driver with autocommit off (pyodbc, JDBC), which opens a transaction with the first statement. Turn autocommit on, or commit after each unit of work: such a session becomes a blocker as soon as it writes and then idles.'
                     END,
-                    N'open_transactions, sessions_by_app, blocking_tree'
+                    N'open_transactions, sessions_by_app, blocking_tree',
+                    N'IDLE_IN_TRANSACTION'
                 ),
                 (
                     CASE WHEN @deadlock_count > 0 OR @f_deadlocks_delta > 0 THEN 3 END,
@@ -8146,9 +9058,28 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @f_deadlocks_delta > 0 THEN CONCAT(@f_deadlocks_delta, N' during the ', @sample_s, N' s sample') END
                     ),
                     N'Review the deadlock graphs in deadlocks for the statements and objects involved. Typical fixes: access objects in the same order, add a covering index, keep transactions short, and let readers use row versioning (RCSI or SNAPSHOT).',
-                    N'deadlocks'
+                    N'deadlocks',
+                    N'DEADLOCKS'
+                ),
+                (
+                    CASE WHEN @f_rollback > 0 THEN CASE WHEN @f_rollback_blocking > 0 THEN 2 ELSE 3 END END,
+                    N'Transactions',
+                    CONCAT(@f_rollback, N' request(s) are rolling back'),
+                    @f_rollback_desc,
+                    N'A rollback cannot be cancelled, and killing the session again does not speed it up. It keeps its locks until it ends. Watch percent_complete and estimated_remaining in requests.',
+                    N'requests, open_transactions, blocking_tree',
+                    N'ROLLBACK_RUNNING'
+                ),
+                (
+                    CASE WHEN @bh_count > 0 THEN 4 END,
+                    N'Blocking',
+                    CONCAT(@bh_count, N' block(s) were reported in the last ', @lookback_minutes, N' min'),
+                    @bh_worst,
+                    N'This is blocking that the service reported, including blocks that have ended. See blocking_history for the blocker, what it ran last and whether it was idle.',
+                    N'blocking_history, blocking_tree',
+                    N'BLOCKING_HISTORY'
                 )
-            ) AS v (sev, area, finding, evidence, action, see)
+            ) AS v (sev, area, finding, evidence, action, see, code)
             WHERE v.sev IS NOT NULL;
         END TRY
         BEGIN CATCH
@@ -8157,14 +9088,15 @@ AND   mh.severity_level >= 3;';
         END CATCH;
 
         BEGIN TRY
-            INSERT #findings (severity_rank, area, finding, evidence, recommended_action, see_section)
+            INSERT #findings (severity_rank, area, finding, evidence, recommended_action, see_section, code)
             SELECT
                 v.sev,
                 v.area,
                 LEFT(v.finding, 400),
                 LEFT(v.evidence, 2000),
                 LEFT(v.action, 2000),
-                v.see
+                v.see,
+                v.code
             FROM
             (
                 VALUES
@@ -8174,7 +9106,8 @@ AND   mh.severity_level >= 3;';
                     N'The database is close to its maximum data size',
                     CONCAT(N'used ', @f_data_used_mb, N' MB of ', @f_data_max_mb, N' MB (', CONVERT(decimal(9, 1), @f_data_pct), N'%); allocated ', @f_data_alloc_mb, N' MB'),
                     N'At the maximum size inserts and updates fail (error 1105). Raise MAXSIZE or the service objective, or purge or archive data.',
-                    N'governance, configuration'
+                    N'governance, configuration',
+                    N'DATA_SIZE_LIMIT'
                 ),
                 (
                     CASE
@@ -8195,7 +9128,8 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @f_tran_oldest_s >= 60 THEN CONCAT(N'; oldest transaction ', @f_tran_oldest_s, N' s (session ', @f_tran_oldest_session, N')') END
                     ),
                     N'The log cannot be truncated past the reason in log_reuse_wait_desc. ACTIVE_TRANSACTION: end the oldest transaction. AVAILABILITY_REPLICA: a replica or geo-secondary is behind. REPLICATION: CDC or replication is not keeping up. When the log is full every write fails (error 9002).',
-                    N'log_usage, open_transactions, replicas'
+                    N'log_usage, open_transactions, replicas',
+                    N'LOG_SPACE'
                 ),
                 (
                     CASE WHEN @f_tdb_data_pct >= 80 OR @f_tdb_log_pct >= 80 THEN 2 END,
@@ -8208,7 +9142,8 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @f_tdb_top_session IS NOT NULL THEN CONCAT(N'; top consumer session ', @f_tdb_top_session, N' with ', CONVERT(decimal(19, 1), @f_tdb_top_mb), N' MB') END
                     ),
                     N'Find the consumer in tempdb_sessions (user objects are temp tables and table variables; internal objects are sorts, hashes, spools and spills). A long transaction can also bloat the tempdb version store. When tempdb is full, queries that need it fail.',
-                    N'tempdb_space, tempdb_sessions, version_store'
+                    N'tempdb_space, tempdb_sessions, version_store',
+                    N'TEMPDB_SPACE'
                 ),
                 (
                     CASE WHEN @f_pvs_mb >= 51200 OR (@f_pvs_mb >= 1024 AND @f_pvs_mb >= 0.1 * @f_data_used_mb) THEN 3 END,
@@ -8221,7 +9156,8 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @f_pvs_oldest_session IS NOT NULL THEN CONCAT(N'; the oldest active transaction belongs to session ', @f_pvs_oldest_session) END
                     ),
                     N'Version cleanup is held back by the oldest active transaction, including long snapshot reads on readable secondaries. Find it in version_store and open_transactions and end it; cleanup then catches up on its own.',
-                    N'version_store, open_transactions'
+                    N'version_store, open_transactions',
+                    N'VERSION_STORE_LARGE'
                 ),
                 (
                     CASE
@@ -8255,7 +9191,8 @@ AND   mh.severity_level >= 3;';
                         THEN N'Try ALTER DATABASE CURRENT SET QUERY_STORE = OFF, then ON (OPERATION_MODE = READ_WRITE). If it stays in ERROR, QUERY_STORE CLEAR ALL (loses the history) or open a support case.'
                         ELSE N'Enable it: ALTER DATABASE CURRENT SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE). Automatic plan correction and most plan regression analysis depend on it.'
                     END,
-                    N'configuration, query_store_top'
+                    N'configuration, query_store_top',
+                    N'QUERY_STORE_STATE'
                 ),
                 (
                     CASE
@@ -8266,7 +9203,8 @@ AND   mh.severity_level >= 3;';
                     N'Query Store is nearly full',
                     CONCAT(@f_qs_used_mb, N' of ', @f_qs_max_mb, N' MB (', CONVERT(decimal(9, 1), @f_qs_pct), N'%); size-based cleanup ', CASE WHEN @f_qs_cleanup_auto = 1 THEN N'AUTO' ELSE N'OFF' END),
                     N'At 100% Query Store switches to READ_ONLY and stops capturing. Raise MAX_STORAGE_SIZE_MB, lower STALE_QUERY_THRESHOLD_DAYS or set SIZE_BASED_CLEANUP_MODE = AUTO; QUERY_CAPTURE_MODE = AUTO skips trivial ad hoc queries.',
-                    N'configuration'
+                    N'configuration',
+                    N'QUERY_STORE_NEARLY_FULL'
                 ),
                 (
                     CASE WHEN @f_at_mismatch IS NOT NULL THEN 3 END,
@@ -8274,7 +9212,8 @@ AND   mh.severity_level >= 3;';
                     N'An automatic tuning option is not in its desired state',
                     @f_at_mismatch,
                     N'The reason explains why (commonly Query Store is off or read-only, or the system disabled the option). Fix the cause: FORCE_LAST_GOOD_PLAN only protects against plan regressions while it is actually on.',
-                    N'configuration, tuning_recommendations'
+                    N'configuration, tuning_recommendations',
+                    N'AUTO_TUNING_STATE'
                 ),
                 (
                     CASE WHEN @f_regressions > 0 THEN 3 END,
@@ -8282,7 +9221,8 @@ AND   mh.severity_level >= 3;';
                     CONCAT(@f_regressions, N' plan regression(s) detected and not yet corrected'),
                     CONCAT(@f_regressions, N' FORCE_LAST_GOOD_PLAN recommendation(s) in state Active'),
                     N'Review tuning_recommendations: each row includes the script that forces the last good plan. With automatic tuning FORCE_LAST_GOOD_PLAN = ON they are applied and verified automatically.',
-                    N'tuning_recommendations, query_store_top'
+                    N'tuning_recommendations, query_store_top',
+                    N'PLAN_REGRESSIONS'
                 ),
                 (
                     CASE WHEN @f_auto_create_stats = 0 OR @f_auto_update_stats = 0 THEN 3 END,
@@ -8294,7 +9234,8 @@ AND   mh.severity_level >= 3;';
                         N', AUTO_UPDATE_STATISTICS ', CASE WHEN @f_auto_update_stats = 1 THEN N'ON' ELSE N'OFF' END
                     ),
                     N'Unless a statistics job deliberately replaces it, turn it back on: ALTER DATABASE CURRENT SET AUTO_CREATE_STATISTICS ON; ALTER DATABASE CURRENT SET AUTO_UPDATE_STATISTICS ON.',
-                    N'configuration, stale_statistics'
+                    N'configuration, stale_statistics',
+                    N'AUTO_STATS_OFF'
                 ),
                 (
                     CASE WHEN @f_auto_shrink = 1 THEN 4 END,
@@ -8302,7 +9243,8 @@ AND   mh.severity_level >= 3;';
                     N'AUTO_SHRINK is on',
                     N'is_auto_shrink_on = 1',
                     N'Repeated shrink and growth wastes IO and fragments indexes: ALTER DATABASE CURRENT SET AUTO_SHRINK OFF.',
-                    N'configuration'
+                    N'configuration',
+                    N'AUTO_SHRINK_ON'
                 ),
                 (
                     CASE WHEN @rcsi = 0 THEN 4 END,
@@ -8310,7 +9252,8 @@ AND   mh.severity_level >= 3;';
                     N'READ_COMMITTED_SNAPSHOT is off',
                     N'is_read_committed_snapshot_on = 0 (the Azure SQL Database default is ON)',
                     N'Readers and writers block each other under locking read committed. If reader/writer blocking matters, test ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON.',
-                    N'configuration, blocking_tree'
+                    N'configuration, blocking_tree',
+                    N'RCSI_OFF'
                 ),
                 (
                     CASE WHEN @f_geo_lag_s >= 60 THEN 3 END,
@@ -8318,7 +9261,8 @@ AND   mh.severity_level >= 3;';
                     N'Geo-replication is lagging',
                     CONCAT(N'replication lag ', @f_geo_lag_s, N' s; link ', @f_geo_partner),
                     N'Lag grows with heavy log generation (index maintenance, bulk loads) or an undersized secondary. Changes inside the lag window are lost on a forced failover. Check the log rate and the secondary service objective.',
-                    N'replicas, resource_stats'
+                    N'replicas, resource_stats',
+                    N'GEO_REPLICATION_LAG'
                 ),
                 (
                     CASE WHEN @f_ha_bad > 0 THEN @f_ha_sev END,
@@ -8326,7 +9270,8 @@ AND   mh.severity_level >= 3;';
                     N'A high-availability replica is unhealthy or suspended',
                     @f_ha_desc,
                     N'Usually transient during a reconfiguration or failover. If it persists, check Azure Resource Health and open a support case.',
-                    N'replicas'
+                    N'replicas',
+                    N'HA_REPLICA_UNHEALTHY'
                 ),
                 (
                     CASE
@@ -8347,7 +9292,8 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @is_sampled = 1 THEN CONCAT(N'in the last ', @sample_s, N' s') ELSE N'since instance start' END
                     ),
                     N'The workload reaches the data IOPS limit of the service objective. Reduce reads and writes (better indexes, fewer scans, no spills) or scale up.',
-                    N'file_io, resource_stats, wait_stats'
+                    N'file_io, resource_stats, wait_stats',
+                    N'IO_GOVERNANCE_QUEUING'
                 ),
                 (
                     CASE
@@ -8366,7 +9312,8 @@ AND   mh.severity_level >= 3;';
                         CASE WHEN @is_sampled = 1 THEN CONCAT(N'in the last ', @sample_s, N' s') ELSE N'since instance start' END
                     ),
                     N'Every commit waits for its log write (WRITELOG). Batch small transactions into fewer commits and check log rate governance (LOG_RATE_GOVERNOR, avg_log_write_percent).',
-                    N'file_io, wait_stats, resource_stats'
+                    N'file_io, wait_stats, resource_stats',
+                    N'LOG_WRITES_SLOW'
                 ),
                 (
                     CASE
@@ -8374,18 +9321,27 @@ AND   mh.severity_level >= 3;';
                         AND  @f_compiles >= 0.1 * @f_batches
                         AND  @f_compiles >= 100 * @f_counter_s
                         THEN 4
+                        WHEN @f_counter_s > 0
+                        AND  @f_recompiles >= 0.1 * @f_batches
+                        AND  @f_recompiles >= 10 * @f_counter_s
+                        THEN 4
                     END,
                     N'Compilations',
-                    N'High compilation rate',
+                    CASE
+                        WHEN @f_compiles >= 0.1 * @f_batches AND @f_compiles >= 100 * @f_counter_s THEN N'High compilation rate'
+                        ELSE N'High recompilation rate'
+                    END,
                     CONCAT
                     (
+                        CONVERT(decimal(19, 1), @f_recompiles / NULLIF(@f_counter_s, 0)), N' recompilations/s, ',
                         CONVERT(decimal(19, 1), @f_compiles / NULLIF(@f_counter_s, 0)), N' compilations/s vs ',
                         CONVERT(decimal(19, 1), @f_batches / NULLIF(@f_counter_s, 0)), N' batch requests/s (',
                         CONVERT(decimal(9, 1), 100.0 * @f_compiles / NULLIF(@f_batches, 0)), N'%) ',
                         CASE WHEN @is_sampled = 1 THEN CONCAT(N'over the last ', @sample_s, N' s') ELSE N'averaged since instance start' END
                     ),
-                    N'Non-parameterized ad hoc SQL compiles on every call and costs CPU. Parameterize in the application; otherwise test PARAMETERIZATION FORCED or OPTIMIZE_FOR_AD_HOC_WORKLOADS. Single-use plans show up in plan_cache_top.',
-                    N'perf_counters, plan_cache_top'
+                    N'Recompilations come from statistics updates, schema or temp table changes and OPTION (RECOMPILE). Non-parameterized ad hoc SQL compiles on every call and costs CPU. Parameterize in the application; otherwise test PARAMETERIZATION FORCED or OPTIMIZE_FOR_AD_HOC_WORKLOADS. Single-use plans show up in plan_cache_top.',
+                    N'perf_counters, plan_cache_top',
+                    N'COMPILATION_RATE'
                 ),
                 (
                     CASE WHEN @f_updateability = N'READ_ONLY' THEN 5 END,
@@ -8393,7 +9349,8 @@ AND   mh.severity_level >= 3;';
                     N'This database is read-only (readable secondary, named replica or geo-secondary)',
                     N'DATABASEPROPERTYEX(Updateability) = READ_ONLY',
                     N'Write-related checks do not apply here. Run the procedure on the primary to see the write workload.',
-                    N'governance, replicas'
+                    N'governance, replicas',
+                    N'DATABASE_READ_ONLY'
                 ),
                 (
                     CASE WHEN @f_rs_latest IS NULL OR @f_rs_latest < DATEADD(MINUTE, -5, @now_utc) THEN 5 END,
@@ -8404,9 +9361,68 @@ AND   mh.severity_level >= 3;';
                         ELSE CONCAT(N'latest row ends at ', CONVERT(nvarchar(19), @f_rs_latest, 120), N' UTC')
                     END,
                     N'CPU, IO, log, worker and session percentages in the summary may be missing or old. The view keeps about an hour of 15-second rows; check the VIEW DATABASE STATE permission.',
-                    N'resource_stats'
+                    N'resource_stats',
+                    N'RESOURCE_STATS_STALE'
+                ),
+                (
+                    CASE WHEN @f_identity_max_pct >= 98 THEN 2 WHEN @f_identity_max_pct >= 90 THEN 3 END,
+                    N'Storage',
+                    CONCAT(@f_identity_count, N' identity column(s) have used 90% or more of their range'),
+                    @f_identity_list,
+                    N'When the range ends, every insert into the table fails with error 8115 (arithmetic overflow). Change the column to a larger data type (this rewrites the table: plan it), or reseed when a large unused range exists.',
+                    N'summary',
+                    N'IDENTITY_RANGE'
+                ),
+                (
+                    CASE
+                        WHEN @f_io_read_count >= CASE WHEN @is_sampled = 1 THEN 100 ELSE 10000 END
+                        THEN
+                            CASE
+                                WHEN @is_sampled = 1 AND @f_io_read_stall_ms >= 100.0 * @f_io_read_count THEN 2
+                                WHEN @is_sampled = 1 AND @f_io_read_stall_ms >= 20.0 * @f_io_read_count THEN 3
+                                WHEN @f_io_read_stall_ms >= 20.0 * @f_io_read_count THEN 4
+                            END
+                    END,
+                    N'Data IO',
+                    N'Data file reads are slow',
+                    CONCAT
+                    (
+                        N'average read ', CONVERT(decimal(19, 2), @f_io_read_stall_ms * 1.0 / NULLIF(@f_io_read_count, 0)), N' ms over ', @f_io_read_count, N' reads ',
+                        CASE WHEN @is_sampled = 1 THEN CONCAT(N'in the last ', @sample_s, N' s') ELSE N'since instance start' END,
+                        CASE WHEN @is_hyperscale = 1 THEN N' (Hyperscale: reads from page servers, the local cache is not counted)' END
+                    ),
+                    N'Queries wait on PAGEIOLATCH for these reads. Reduce the reads (indexes, fewer scans) and check Data IO % and governance queuing in file_io. On Hyperscale these pages were not in the local cache.',
+                    N'file_io, wait_stats, requests',
+                    N'DATA_READS_SLOW'
+                ),
+                (
+                    CASE WHEN @instance_start > DATEADD(MINUTE, -60, @now) THEN 4 END,
+                    N'Database',
+                    CONCAT(N'The database engine started ', DATEDIFF(MINUTE, @instance_start, @now), N' min ago'),
+                    CONCAT(N'instance start ', CONVERT(nvarchar(19), @instance_start, 120), N' UTC (restart, failover or change of service objective)'),
+                    N'The plan cache and the buffer pool are cold, so compilations and reads are higher than normal for a while. Results that are cumulative since the start cover only this time.',
+                    N'summary, perf_counters',
+                    N'RECENT_START'
+                ),
+                (
+                    CASE WHEN @f_force_failed > 0 THEN 3 END,
+                    N'Query Store',
+                    CONCAT(@f_force_failed, N' forced plan(s) or Query Store hint(s) failed to apply'),
+                    CONCAT(@f_force_failed, N' of ', @f_force_total, N' forced plans and hints have failures; worst: ', @f_force_example),
+                    N'The query does not run with the plan or hint that was set, and the failed attempt can add compile time. See plan_forcing: the script column unforces the plan or clears the hint. Then correct the cause, or force a plan that still can be built.',
+                    N'plan_forcing, query_store_top',
+                    N'PLAN_FORCING_FAILED'
+                ),
+                (
+                    CASE WHEN @stats_recent > 0 THEN 5 END,
+                    N'Statistics',
+                    CONCAT(@stats_recent, N' statistics were updated in the last 15 minutes'),
+                    @stats_recent_list,
+                    N'A statistics update makes the plans that use it compile again, and the new plan is built for the parameter values of the first caller. If a query became slow at that time, compare its plans in query_store_top.',
+                    N'stale_statistics, query_store_top',
+                    N'STATISTICS_UPDATED'
                 )
-            ) AS v (sev, area, finding, evidence, action, see)
+            ) AS v (sev, area, finding, evidence, action, see, code)
             WHERE v.sev IS NOT NULL;
         END TRY
         BEGIN CATCH
@@ -8426,7 +9442,7 @@ AND   mh.severity_level >= 3;';
 
         IF NOT EXISTS (SELECT 1/0 FROM #findings AS f WHERE f.severity_rank <= 4)
         BEGIN
-            INSERT #findings (severity_rank, area, finding, evidence, recommended_action, see_section)
+            INSERT #findings (severity_rank, area, finding, evidence, recommended_action, see_section, code)
             VALUES
             (
                 5,
@@ -8455,7 +9471,8 @@ AND   mh.severity_level >= 3;';
                     THEN N'Nothing needs attention right now. @effort = ''slow'' adds Query Store, deadlocks, statistics and index usage.'
                     ELSE N'Nothing needs attention right now. @sample_seconds = 10 measures live waits, IO and counters; @effort = ''slow'' adds Query Store, deadlocks, statistics and index usage.'
                 END,
-                N'summary'
+                N'summary',
+                N'NO_PROBLEMS'
             );
         END;
 
@@ -8512,7 +9529,8 @@ AND   mh.severity_level >= 3;';
                 finding = f.finding,
                 evidence = f.evidence,
                 recommended_action = f.recommended_action,
-                see_results = f.see_section
+                see_results = f.see_section,
+                code = f.code
             INTO #o_findings
             FROM #findings AS f;
         END TRY
@@ -8747,7 +9765,8 @@ AND   mh.severity_level >= 3;';
                         CASE @f_qs_cleanup_auto WHEN 1 THEN N'AUTO' WHEN 0 THEN N'OFF' ELSE N'n/a' END,
                         CASE WHEN @f_qs_readonly_reason > 0 THEN CONCAT(N', readonly_reason ', @f_qs_readonly_reason) END,
                         N'; automatic tuning: ', ISNULL(@f_at_mismatch, N'actual state matches desired'),
-                        CASE WHEN @f_regressions > 0 THEN CONCAT(N'; ', @f_regressions, N' plan regression(s) not yet corrected') END
+                        CASE WHEN @f_regressions > 0 THEN CONCAT(N'; ', @f_regressions, N' plan regression(s) not yet corrected') END,
+                        CASE WHEN @f_force_total > 0 THEN CONCAT(N'; ', @f_force_total, N' forced plan(s) and hint(s), ', ISNULL(@f_force_failed, 0), N' with failures') END
                     )
                 ),
                 (

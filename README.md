@@ -24,11 +24,11 @@ EXEC DBATools.usp_GetDBStatus @help = 1;
 
 ## Status
 
-Versions 2.1.0 and 2.1.1 of `usp_GetDBStatus` ran on one Azure SQL Database (Hyperscale) on 2026-11-19 with no error, and so did one sampled run of 2.1.2. Version 2.1.3 adds one finding; it parses without errors (Microsoft ScriptDom, TSql170) and has not yet run on Azure SQL Database. Run the test in [`DBATools/README.md`](DBATools/README.md) before you rely on it. Version 2.0.0 is the first commit of the file.
+Versions 2.1.0 and 2.1.1 of `usp_GetDBStatus` ran on one Azure SQL Database (Hyperscale) on 2026-11-19 with no error, and so did one sampled run of 2.1.2. Versions 2.1.3 and 2.2.0 parse without errors (Microsoft ScriptDom, TSql170) and have not yet run on Azure SQL Database. Run the test in [`DBATools/README.md`](DBATools/README.md) before you rely on it. Version 2.0.0 is the first commit of the file.
 
 ## How to test
 
-- On a database: the four commands under "Test after deploy" in [`DBATools/README.md`](DBATools/README.md). They are also in the header comment of the procedure.
+- On a database: the five commands under "Test after deploy" in [`DBATools/README.md`](DBATools/README.md). They are also in the header comment of the procedure.
 - Static syntax check, on macOS with the VS Code `mssql` extension:
 
 ```bash
@@ -40,6 +40,10 @@ Expected output: `usp_GetDBStatus.sql: 0 parse error(s)`.
 ## Deploy
 
 There is no pipeline. You deploy a script by hand in each database. Nothing in this repository runs on a schedule or connects to a database.
+
+## Credits
+
+Ideas for several checks come from three MIT-licensed projects: the [First Responder Kit](https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit) (Brent Ozar Unlimited), [DarlingData](https://github.com/erikdarlingdata/DarlingData) (Erik Darling) and [FreeSQLServerScripts](https://github.com/LitKnd/FreeSQLServerScripts) (Kendra Little). No code from them is in this repository.
 
 ## Known limits
 
