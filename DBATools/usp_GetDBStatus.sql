@@ -5,7 +5,7 @@ SET QUOTED_IDENTIFIER ON
 GO
 
 /*
-    DBATools.usp_GetDBStatus 2.1.2 (2026-11-19)
+    DBATools.usp_GetDBStatus 2.1.3 (2026-11-19)
 
     Purpose        Shows what is happening on one Azure SQL Database now: health summary and
                    findings, blocking, requests, waits, resources, memory, tempdb, transactions,
@@ -38,6 +38,12 @@ GO
 
         -- 4. log_usage: log_max_mb must be a plausible log limit for the service objective.
         EXEC DBATools.usp_GetDBStatus @section = 'transactions';
+
+    Changes in 2.1.3 (from the run of 2.1.2 on Azure SQL Database)
+    - New finding: a query that has held a memory grant of 1 GB or more for at least 60 seconds
+      and has used less than 10 % of it. MEDIUM when the grant is 20 % or more of the memory the
+      user pool can grant, LOW from 5 %. The run showed one query with a 60 GB grant (24 % of
+      the pool) that used 1.2 GB, and no finding.
 
     Changes in 2.1.2 (from the run of 2.1.1 on Azure SQL Database)
     - New result session_waits_sampled (with @sample_seconds): the waits of the sessions in this
@@ -99,7 +105,7 @@ BEGIN
     SET DEADLOCK_PRIORITY LOW;
 
     SELECT
-        @version = '2.1.2',
+        @version = '2.1.3',
         @version_date = '20261119';
 
     /* ============================================================================================
@@ -107,7 +113,7 @@ BEGIN
        ============================================================================================ */
     IF @help = 1
     BEGIN
-        PRINT N'DBATools.usp_GetDBStatus v2.1.2 - what is happening on this Azure SQL Database right now.';
+        PRINT N'DBATools.usp_GetDBStatus v2.1.3 - what is happening on this Azure SQL Database right now.';
         PRINT N'Run it in the database you want to inspect. Everything it does is read-only.';
 
         SELECT
@@ -6959,6 +6965,12 @@ LEFT JOIN tempdb.sys.dm_db_log_space_usage AS ls
         @f_grants_active int,
         @f_grant_wait_ms bigint,
         @f_granted_mb decimal(19, 1),
+        @f_grant_big_session int,
+        @f_grant_big_mb decimal(19, 1),
+        @f_grant_big_used_mb decimal(19, 1),
+        @f_grant_big_s bigint,
+        @f_grant_big_dop int,
+        @f_grant_target_mb decimal(19, 1),
         @f_threadpool_tasks int,
         @f_waits_now nvarchar(2000),
         @f_top_wait_now nvarchar(128),
@@ -7493,6 +7505,30 @@ AND   mh.severity_level >= 3;';
             FROM #wt AS w
             WHERE w.wait_type = N'THREADPOOL'
             AND   w.task_rank = 1;
+
+            /* The largest grant that has been held for a minute or more and is mostly unused, and
+               the memory that the user pool can grant in total */
+            SELECT TOP (1)
+                @f_grant_big_session = g.session_id,
+                @f_grant_big_mb = g.granted_memory_kb / 1024.0,
+                @f_grant_big_used_mb = ISNULL(g.max_used_memory_kb, 0) / 1024.0,
+                @f_grant_big_s = DATEDIFF_BIG(SECOND, g.grant_time, @now),
+                @f_grant_big_dop = g.dop
+            FROM #grants AS g
+            LEFT JOIN #sess AS s
+              ON s.session_id = g.session_id
+            WHERE g.grant_time IS NOT NULL
+            AND   g.granted_memory_kb >= 1048576
+            AND   ISNULL(g.max_used_memory_kb, 0) < 0.10 * g.granted_memory_kb
+            AND   DATEDIFF_BIG(SECOND, g.grant_time, @now) >= 60
+            AND   ISNULL(s.database_id, @db_id) = @db_id
+            ORDER BY
+                g.granted_memory_kb DESC;
+
+            SELECT
+                @f_grant_target_mb = SUM(CONVERT(bigint, rs.target_memory_kb)) / 1024.0
+            FROM sys.dm_exec_query_resource_semaphores AS rs
+            WHERE rs.pool_id = @user_pool_id;
         END TRY
         BEGIN CATCH
             INSERT #messages (msg_type, section, message)
@@ -7954,6 +7990,28 @@ AND   mh.severity_level >= 3;';
                     ),
                     N'Compare requested and used memory in memory_grants: oversized grants come from bad estimates and large sorts or hashes. Fix the query or index, or cap the grant with a MAX_GRANT_PERCENT hint (a Query Store hint works without code changes).',
                     N'memory_grants, resource_semaphores, requests'
+                ),
+                (
+                    CASE
+                        WHEN @f_grant_big_mb >= 0.20 * @f_grant_target_mb THEN 3
+                        WHEN @f_grant_big_mb >= 0.05 * @f_grant_target_mb THEN 4
+                        WHEN @f_grant_target_mb IS NULL AND @f_grant_big_mb >= 10240 THEN 4
+                    END,
+                    N'Memory',
+                    CONCAT
+                    (
+                        N'A query holds a ', CONVERT(decimal(19, 1), @f_grant_big_mb / 1024.0), N' GB memory grant and has used ',
+                        CONVERT(decimal(9, 1), 100.0 * @f_grant_big_used_mb / NULLIF(@f_grant_big_mb, 0)), N'% of it'
+                    ),
+                    CONCAT
+                    (
+                        N'session ', @f_grant_big_session, N': granted ', @f_grant_big_mb, N' MB, most used so far ', @f_grant_big_used_mb,
+                        N' MB, held for ', @f_grant_big_s, N' s, DOP ', ISNULL(CONVERT(nvarchar(12), @f_grant_big_dop), N'n/a'),
+                        N'; the grant is ' + CONVERT(nvarchar(20), CONVERT(decimal(9, 1), 100.0 * @f_grant_big_mb / NULLIF(@f_grant_target_mb, 0)))
+                        + N'% of the ' + CONVERT(nvarchar(30), @f_grant_target_mb) + N' MB that the user pool can grant'
+                    ),
+                    N'The grant stays reserved until the query ends, and other queries that need a large grant can then wait (RESOURCE_SEMAPHORE). The estimate is too high: stale statistics, a row estimate far above the real row count, or wide columns in a sort or hash. Update the statistics, return and sort fewer and narrower columns, or cap the grant with a MAX_GRANT_PERCENT hint (a Query Store hint needs no code change). Memory grant feedback, when it is enabled, lowers the grant for later executions of the same plan.',
+                    N'memory_grants, requests, query_store_top'
                 ),
                 (
                     /* Snapshots arrive about every 15 seconds; one or two HIGH snapshots are a brief blip */

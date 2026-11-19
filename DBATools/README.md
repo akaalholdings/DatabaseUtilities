@@ -9,7 +9,8 @@ Status:
 - Version 2.1.0 ran on one Azure SQL Database (Hyperscale) on 2026-11-19. The four test commands below completed and MESSAGES held no `ERROR` row.
 - That database had no blocking and no worker starvation at the time. The blocking tree and the THREADPOOL path have therefore not yet run with data.
 - Version 2.1.1 fixed what that run showed (see the header of the script). It ran on the same database on the same day: the four test commands completed, MESSAGES held no `ERROR` row, and each fix was visible in the results.
-- Version 2.1.2 adds the result `session_waits_sampled`. It parses without errors and has not yet run on Azure SQL Database. Run the test below before you rely on it.
+- Version 2.1.2 added the result `session_waits_sampled`. One sampled run (`@section = 'summary,waits,requests', @sample_seconds = 60`) on the same database completed with no error. For one running parallel query the new result showed 884 seconds of parallelism waits in the 60 seconds; the database wait statistics showed 2.5 seconds in total. The other sections did not run again with 2.1.2.
+- Version 2.1.3 adds one finding (a large memory grant that is mostly unused). It parses without errors and has not yet run on Azure SQL Database. Run the test below before you rely on it.
 
 ## Deploy
 
